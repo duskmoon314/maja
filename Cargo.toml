@@ -1,0 +1,83 @@
+[package]
+name = "maja"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Packet parsing, capture file I/O, and packet crafting utilities."
+readme = "README.md"
+keywords = ["network", "packet", "pcap"]
+categories = ["network-programming"]
+include = [
+    "/src",
+    "/examples/*.rs",
+    "maja-logo.svg",
+    "README.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+]
+
+[dependencies]
+bitflags = "2.13.0"
+bytes = "1.12.0"
+log = { workspace = true }
+num_enum = "0.7.6"
+pcap = "2.4.0"
+strum = { version = "0.28.0", features = ["derive"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+
+[workspace]
+members = [
+    ".",
+    "examples/pcap-read",
+    "examples/ping",
+    "tools/maja-capinfo",
+    "tools/maja-mergecap",
+    "tools/maja-splitcap",
+]
+
+[workspace.package]
+authors = ["duskmoon (Campbell He) <kp.campbell.he@duskmoon314.com>"]
+edition = "2024"
+repository = "https://github.com/duskmoon314/maja"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# CLI
+clap = { version = "4.6.1", features = ["derive"] }
+
+# CLI / Config
+glob = "0.3.3"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+
+# Logging
+log = "0.4.33"
+env_logger = "0.11.11"
+indicatif = "0.18.5"
+indicatif-log-bridge = "0.2.3"
+
+# Networking
+socket2 = { version = "0.6.4", features = ["all"] }
+
+# Error
+anyhow = "1.0.103"
+thiserror = "2.0.18"
+
+# Other utils
+ipnet = { version = "2.12.0", features = ["serde"] }
+rand = "0.10.2"
+tempfile = "3.27.0"
+
+maja = { path = ".", version = "0.1.0" }
+
+[profile.release-size]
+inherits = "release"
+strip = true         # Strip symbols
+opt-level = "z"      # Optimize for size
+lto = true           # Enable link-time optimization
+codegen-units = 1    # Better optimization (slower compile)

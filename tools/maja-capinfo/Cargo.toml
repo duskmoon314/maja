@@ -1,0 +1,31 @@
+[package]
+name = "maja-capinfo"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "A CLI tool to print information about capture files."
+readme = "README.md"
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+indicatif = { workspace = true }
+indicatif-log-bridge = { workspace = true }
+maja = { workspace = true }
+polars = { version = "0.54.4", default-features = false, features = [
+    "performant",
+    "csv",
+    "parquet",
+    "lazy",
+    "dtype-u8",
+    "dtype-u16",
+] }
+temporal_rs = { version = "0.2.4", default-features = false, features = [
+    "compiled_data",
+] }
+human_format = "1.2.1"

@@ -1,0 +1,25 @@
+[package]
+name = "maja-mergecap"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Merge capture files with configurations."
+readme = "README.md"
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+env_logger = { workspace = true }
+glob = { workspace = true }
+indicatif = { workspace = true }
+indicatif-log-bridge = { workspace = true }
+ipnet = { workspace = true }
+log = { workspace = true }
+maja = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }

@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="260" height="120" viewBox="80 240 920 410" role="img" aria-labelledby="title desc">
+  <title id="title">maja mark</title>
+  <desc id="desc">Rusty orange angular maja mark based on the GeoGebra logo construction.</desc>
+  <g
+    fill="none"
+    stroke="#e85d3f"
+    stroke-width="24"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  >
+    <path d="M538.897 443.295 L825.261 277.963" />
+    <path d="M538.897 443.295 L252.533 277.963" />
+    <path d="M682.079 360.629 L825.261 608.627" />
+    <path d="M395.715 360.629 L252.533 608.627" />
+    <path d="M825.261 277.963 L968.442 525.961" />
+    <path d="M252.533 277.963 L109.351 525.961" />
+    <path d="M395.715 360.629 L462.268 360.629" />
+    <path d="M682.079 360.629 L615.526 360.629" />
+    <path d="M157.079 443.295 L347.988 443.295" />
+    <path d="M920.715 443.295 L729.806 443.295" />
+  </g>
+</svg>
