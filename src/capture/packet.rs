@@ -76,3 +76,25 @@ impl Ord for PacketRecord<'_> {
         self.timestamp.cmp(&other.timestamp)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_record_order() {
+        use std::cmp::Reverse;
+
+        let pkt1 = PacketRecord::new(1, 100, vec![0; 100], LinkType::Ethernet);
+        let pkt2 = PacketRecord::new(2, 100, vec![0; 100], LinkType::Ethernet);
+        let pkt3 = PacketRecord::new(3, 100, vec![0; 100], LinkType::Ethernet);
+
+        assert!(pkt1 < pkt2);
+        assert!(pkt2 < pkt3);
+
+        assert!(Reverse(&pkt3) < Reverse(&pkt2));
+        assert!(Reverse(&pkt2) < Reverse(&pkt1));
+
+        assert!((pkt1, 3) < (pkt2, 2));
+    }
+}

@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     collections::BinaryHeap,
     fs::File,
     net::{IpAddr, Ipv4Addr},
@@ -120,7 +121,7 @@ fn merge_impl(
         let mut output_file = std::fs::File::create(output_file)?;
 
         let total_streams: usize = input_files.iter().map(|f| f.parallel as usize).sum();
-        let mut packet_heap: BinaryHeap<(usize, PacketRecord<'static>)> =
+        let mut packet_heap: BinaryHeap<Reverse<(PacketRecord<'static>, usize)>> =
             BinaryHeap::with_capacity(total_streams);
 
         let mut readers = input_files
@@ -147,14 +148,14 @@ fn merge_impl(
 
         for (i, reader) in readers.iter_mut().enumerate() {
             if let Some(packets) = reader.next() {
-                packet_heap.extend(packets.into_iter().map(|p| (i, p)));
+                packet_heap.extend(packets.into_iter().map(|p| Reverse((p, i))));
             }
         }
 
         // We assume all input files have the same link type
         let link_type = packet_heap
             .peek()
-            .map(|(_, p)| p.link_type)
+            .map(|Reverse((p, _))| p.link_type)
             .unwrap_or(LinkType::Ethernet);
 
         let mut pcap_writer = maja::capture::format::pcap::PcapWriter::new(
@@ -165,7 +166,7 @@ fn merge_impl(
             link_type,
         )?;
 
-        while let Some((reader_index, packet)) = packet_heap.pop() {
+        while let Some(Reverse((packet, reader_index))) = packet_heap.pop() {
             pcap_writer.write_packet(&packet)?;
             write_pg.inc(1);
 
@@ -173,7 +174,7 @@ fn merge_impl(
             if packet_heap.len() < total_streams
                 && let Some(packets) = readers[reader_index].next()
             {
-                packet_heap.extend(packets.into_iter().map(|p| (reader_index, p)));
+                packet_heap.extend(packets.into_iter().map(|p| Reverse((p, reader_index))));
             }
         }
 
