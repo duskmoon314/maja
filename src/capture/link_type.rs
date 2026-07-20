@@ -18,6 +18,7 @@ use strum::{AsRefStr, Display, EnumString};
     Display,
     EnumString,
 )]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[repr(u16)]
 #[non_exhaustive]
 /// Link-layer header type values used by PCAP and PCAPNG.

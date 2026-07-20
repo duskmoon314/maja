@@ -18,10 +18,14 @@ include = [
     "LICENSE-MIT",
 ]
 
+[features]
+serde = ["dep:serde"]
+
 [dependencies]
 bitflags = "2.13.0"
 log = { workspace = true }
 num_enum = "0.7.6"
+serde = { workspace = true, optional = true }
 strum = { version = "0.28.0", features = ["derive"] }
 thiserror = { workspace = true }
 

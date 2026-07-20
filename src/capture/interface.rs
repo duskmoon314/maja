@@ -8,6 +8,7 @@ use std::fmt::Display;
 use crate::capture::link_type::LinkType;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 /// Link-layer and timestamp metadata for a capture interface.
 pub struct Interface {
     /// Link-layer type used by packets captured on this interface.
@@ -20,6 +21,7 @@ pub struct Interface {
 
 /// # Resolution of the timestamp
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum Resolution {
     /// Timestamp units are `2^-n` seconds.
     PowerOfTwo(u8),

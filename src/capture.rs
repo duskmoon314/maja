@@ -59,7 +59,8 @@ pub trait CaptureReader {
 }
 
 /// Capture container format detected from a file magic value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::Display)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum CaptureFormat {
     /// Classic libpcap file format.
     Pcap,
