@@ -2,7 +2,11 @@
 
 `maja-capinfo` is a `capinfos`-like tool that prints summary information for capture files.
 
-It is built upon `maja` and `polars` (for aggregation).
+## Installation
+
+```bash
+cargo install maja-capinfo
+```
 
 ## Usage
 
@@ -19,6 +23,7 @@ Options:
   -d, --dump <DUMP>      Whether to dump the inner metadata of all packets in the capture file [possible values: csv, parquet]
   -o, --output <OUTPUT>  The output directory for dumped files. If not specified, the same directory as the input file will be used
   -k, --top-k <TOP_K>    The number of top items to display in the statistics [default: 10]
+      --batch-size <BATCH_SIZE>  The maximum number of packet metadata rows buffered before a dump batch is written [default: 65536]
   -h, --help             Print help (see more with '--help')
   -V, --version          Print version
 ```

@@ -21,7 +21,6 @@ polars = { version = "0.54.4", default-features = false, features = [
     "performant",
     "csv",
     "parquet",
-    "lazy",
     "dtype-u8",
     "dtype-u16",
 ] }
@@ -29,3 +28,5 @@ temporal_rs = { version = "0.2.4", default-features = false, features = [
     "compiled_data",
 ] }
 human_format = "1.2.1"
+tempfile = { workspace = true }
+itertools = "0.15.0"
