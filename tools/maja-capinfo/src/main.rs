@@ -1,12 +1,13 @@
 use std::{
     fs::File,
+    io::Write,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use clap::{Args, Parser};
-use log::{debug, error};
+use log::{debug, error, info};
 use maja::{
     capture::CaptureReader,
     packet::{
@@ -23,9 +24,11 @@ use maja::{
 
 mod analysis;
 mod metadata;
+mod report;
 
 use analysis::Stats;
-use metadata::{DumpFormat, DumpResult, MetadataDumper, PacketMetadata};
+use metadata::{DumpFormat, MetadataDumper, PacketMetadata};
+use report::{CaptureReport, FileReport, ReportFormat, write_reports};
 
 /// maja-capinfo
 ///
@@ -47,7 +50,7 @@ struct Flags {
     #[arg(short, long, value_enum)]
     dump: Option<DumpFormat>,
 
-    /// The output directory for dumped files. If not specified, the same directory as the input file will be used.
+    /// The output directory for generated files. If not specified, the input directory is used.
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -58,6 +61,14 @@ struct Flags {
     /// The maximum number of packet metadata rows buffered before a dump batch is written
     #[arg(long, default_value_t = unsafe { NonZeroUsize::new_unchecked(65536) })]
     batch_size: NonZeroUsize,
+
+    /// Report output format
+    #[arg(long, value_enum, default_value_t)]
+    format: ReportFormat,
+
+    /// Write each report to a file instead of stdout
+    #[arg(long)]
+    report_file: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -74,15 +85,36 @@ fn main() -> anyhow::Result<()> {
 
     debug!("CLI arguments: {:?}", cli);
 
-    for input in cli.inputs {
-        info(&input, &cli.flags, &multi)?;
+    let mut reports = Vec::with_capacity(cli.inputs.len());
+    for input in &cli.inputs {
+        reports.push(analyze(input, &cli.flags, &multi)?);
+    }
+
+    if cli.flags.report_file {
+        for (input, report) in cli.inputs.iter().zip(&reports) {
+            write_report_file(
+                &report_path(
+                    input,
+                    cli.flags.output.as_deref(),
+                    cli.flags.format.extension(),
+                ),
+                report,
+                cli.flags.format,
+            )?;
+        }
+    } else {
+        write_reports(std::io::stdout().lock(), &reports, cli.flags.format)?;
     }
 
     Ok(())
 }
 
 /// Process a single capture file
-fn info(file_path: &Path, args: &Flags, multi: &indicatif::MultiProgress) -> anyhow::Result<()> {
+fn analyze(
+    file_path: &Path,
+    args: &Flags,
+    multi: &indicatif::MultiProgress,
+) -> anyhow::Result<CaptureReport> {
     let file = File::open(file_path)?;
     let file_size = file.metadata()?.len();
 
@@ -207,159 +239,18 @@ fn info(file_path: &Path, args: &Flags, multi: &indicatif::MultiProgress) -> any
 
     pg.finish_and_clear();
 
-    let humanize = human_format::Formatter::new();
-
-    // Print statistics
-    println!("{}", "=".repeat(70));
-    println!("File:               {}", file_path.display());
-    println!("  Format:           {:?}", format);
-    println!("  Size:             {}B", humanize.format(file_size as f64));
-    println!("  Processing Time:  {:.6} s", processing_time.as_secs_f64());
-    println!("  Interfaces:");
-    for (i, iface) in reader.interfaces().iter().enumerate() {
-        println!(
-            "    #{i:<15}LinkType = {}, SnapLen = {}, Resolution = {}",
-            iface.link_type, iface.snap_len, iface.resolution
-        );
-    }
-
-    println!("\nPacket Statistics:");
-    println!(
-        "  Total Packets:    {}",
-        humanize.format(stats.total_packets as f64)
-    );
-    println!(
-        "  Total L2 Bytes:   {}B",
-        humanize.format(stats.total_l2_bytes as f64)
-    );
-    println!(
-        "    Avg L2 Length:  {:.2}B",
-        average(stats.total_l2_bytes, stats.total_packets)
-    );
-    println!(
-        "  Total L3 Bytes:   {}B",
-        humanize.format(stats.total_l3_bytes as f64)
-    );
-    println!(
-        "    Avg L3 Length:  {:.2}B",
-        average(stats.total_l3_bytes, stats.total_packets)
-    );
-    println!("  Empty Packets:    {}", stats.empty_packets);
-    println!("  Errors:           {}", stats.errors);
-    println!("  Ordered:          {}", stats.is_ordered);
-
-    let duration_seconds = if let (Some(first_timestamp), Some(last_timestamp)) =
-        (stats.first_timestamp, stats.last_timestamp)
-    {
-        let first_packet_time = temporal_rs::Instant::try_new(first_timestamp as i128)?;
-        let last_packet_time = temporal_rs::Instant::try_new(last_timestamp as i128)?;
-
-        println!(
-            "  First packet:     {} ({})",
-            temporal_rs::ZonedDateTime::try_new_from_instant(
-                first_packet_time,
-                temporal_rs::UtcOffset::from_minutes(0).into(),
-                temporal_rs::Calendar::ISO
-            )?,
-            first_timestamp
-        );
-        println!(
-            "  Last packet:      {} ({})",
-            temporal_rs::ZonedDateTime::try_new_from_instant(
-                last_packet_time,
-                temporal_rs::UtcOffset::from_minutes(0).into(),
-                temporal_rs::Calendar::ISO
-            )?,
-            last_timestamp
-        );
-
-        let duration = last_packet_time.since(&first_packet_time, Default::default())?;
-        println!("  Duration:         {}", duration);
-        duration
-            .total(temporal_rs::options::Unit::Second, None)?
-            .as_inner()
-    } else {
-        println!("  First packet:     N/A");
-        println!("  Last packet:      N/A");
-        println!("  Duration:         N/A");
-        0.0
-    };
-    println!(
-        "  Throughput:       {}pps, {}Bps",
-        humanize.format(rate(stats.total_packets, duration_seconds)),
-        humanize.format(rate(stats.total_l2_bytes, duration_seconds))
-    );
-
-    println!("\nAggregated Statistics:");
-    println!(
-        "  Length:           {:.2} (± {:.2}) [{}, {}] Bytes",
-        stats.lengths.mean(),
-        stats.lengths.std_dev(1),
-        stats.lengths.min(),
-        stats.lengths.max(),
-    );
-
-    println!("  Unique SRC IP:    {}", stats.unique_src_ips());
-    println!("  Unique DST IP:    {}", stats.unique_dst_ips());
-    println!("  TCP Count:        {}", stats.tcp_count);
-    println!("  UDP Count:        {}", stats.udp_count);
-    println!("  Unique SRC Ports: {}", stats.unique_src_ports());
-    println!("  Unique DST Ports: {}", stats.unique_dst_ports());
-    println!("  Unique 5-tuple:   {}", stats.flow_set.len());
-
-    println!("\nTop{} Statistics:", args.top_k);
-    println!("  Top {} SRC IPs:", args.top_k);
-    for (src_ip4, value) in stats.top_src_ips(args.top_k) {
-        println!(
-            "    {:<15} {:>8}pkts, {:>8}B",
-            std::net::Ipv4Addr::from(src_ip4),
-            humanize.format(value.count as f64),
-            humanize.format(value.bytes as f64)
-        );
-    }
-    println!("  Top {} DST IPs:", args.top_k);
-    for (dst_ip4, value) in stats.top_dst_ips(args.top_k) {
-        println!(
-            "    {:<15} {:>8}pkts, {:>8}B",
-            std::net::Ipv4Addr::from(dst_ip4),
-            humanize.format(value.count as f64),
-            humanize.format(value.bytes as f64)
-        );
-    }
-    println!("  Top {} SRC Ports:", args.top_k);
-    for (src_port, value) in stats.top_src_ports(args.top_k) {
-        println!(
-            "    {:<15} {:>8}pkts, {:>8}B",
-            src_port,
-            humanize.format(value.count as f64),
-            humanize.format(value.bytes as f64)
-        );
-    }
-    println!("  Top {} DST Ports:", args.top_k);
-    for (dst_port, value) in stats.top_dst_ports(args.top_k) {
-        println!(
-            "    {:<15} {:>8}pkts, {:>8}B",
-            dst_port,
-            humanize.format(value.count as f64),
-            humanize.format(value.bytes as f64)
-        );
-    }
-
-    if let Some(DumpResult {
-        path,
-        format,
-        elapsed,
-    }) = dump_result
-    {
-        println!("\nExport Statistics:");
-        println!("  Output File: {}", path.display());
-        println!("  Format:                  {format:>12?}");
-        println!("  Elapsed Time:   {:>12.6} s", elapsed.as_secs_f64());
-    }
-
-    println!("{}", "=".repeat(70));
-
-    Ok(())
+    Ok(CaptureReport::new(
+        FileReport::new(
+            file_path,
+            format,
+            file_size,
+            processing_time,
+            &reader.interfaces(),
+        ),
+        &stats,
+        args.top_k,
+        dump_result,
+    ))
 }
 
 fn dump_path(file_path: &Path, output: Option<&Path>, format: DumpFormat) -> PathBuf {
@@ -374,10 +265,28 @@ fn dump_path(file_path: &Path, output: Option<&Path>, format: DumpFormat) -> Pat
         .with_extension(extension)
 }
 
-fn average(total: u64, count: u64) -> f64 {
-    total as f64 / count as f64
+fn report_path(file_path: &Path, output: Option<&Path>, extension: &str) -> PathBuf {
+    output
+        .map(|directory| directory.join(file_path.file_name().expect("Invalid input file name")))
+        .unwrap_or_else(|| file_path.to_path_buf())
+        .with_extension(format!("capinfo.{extension}"))
 }
 
-fn rate(total: u64, duration_seconds: f64) -> f64 {
-    total as f64 / duration_seconds
+fn write_report_file(
+    path: &Path,
+    report: &CaptureReport,
+    format: ReportFormat,
+) -> anyhow::Result<()> {
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(directory)?;
+
+    let mut tempfile = tempfile::NamedTempFile::new_in(directory)?;
+    write_reports(&mut tempfile, std::slice::from_ref(report), format)?;
+    tempfile.flush()?;
+    tempfile.persist(path)?;
+    info!("Report written to {}", path.display());
+    Ok(())
 }

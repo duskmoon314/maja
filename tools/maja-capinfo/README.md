@@ -21,12 +21,35 @@ Arguments:
 
 Options:
   -d, --dump <DUMP>      Whether to dump the inner metadata of all packets in the capture file [possible values: csv, parquet]
-  -o, --output <OUTPUT>  The output directory for dumped files. If not specified, the same directory as the input file will be used
+  -o, --output <OUTPUT>  The output directory for generated files. If not specified, the input directory is used
   -k, --top-k <TOP_K>    The number of top items to display in the statistics [default: 10]
       --batch-size <BATCH_SIZE>  The maximum number of packet metadata rows buffered before a dump batch is written [default: 65536]
+      --format <FORMAT>  Report output format [default: text] [possible values: text, json, toml, yaml]
+      --report-file      Write each report to a file instead of stdout
   -h, --help             Print help (see more with '--help')
   -V, --version          Print version
 ```
+
+## Structured reports
+
+Write JSON to stdout:
+
+```bash
+maja-capinfo --format json capture.pcap
+```
+
+Write one YAML report per capture to an output directory:
+
+```bash
+maja-capinfo --format yaml --report-file --output reports capture.pcap
+# reports/capture.capinfo.yaml
+```
+
+Structured reports include the producing `maja-capinfo` version and use raw
+units in field names. A single JSON report is pretty-printed. With multiple
+inputs, JSON uses one compact object per line, YAML uses a document stream, and
+TOML uses a `[[reports]]` array of tables. A single TOML report is a standalone
+document.
 
 Use Wireshark's [vlan.cap](https://wiki.wireshark.org/uploads/__moin_import__/attachments/SampleCaptures/vlan.cap.gz) as an example:
 

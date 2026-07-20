@@ -16,7 +16,7 @@ log = { workspace = true }
 env_logger = { workspace = true }
 indicatif = { workspace = true }
 indicatif-log-bridge = { workspace = true }
-maja = { workspace = true }
+maja = { workspace = true, features = ["serde"] }
 polars = { version = "0.54.4", default-features = false, features = [
     "performant",
     "csv",
@@ -30,3 +30,7 @@ temporal_rs = { version = "0.2.4", default-features = false, features = [
 human_format = "1.2.1"
 tempfile = { workspace = true }
 itertools = "0.15.0"
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "1.1.3"
+yaml_serde = "0.10.4"

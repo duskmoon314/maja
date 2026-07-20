@@ -6,14 +6,20 @@ use std::{
 
 use clap::ValueEnum;
 use polars::prelude::*;
+use serde::Serialize;
 use tempfile::TempPath;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+/// File formats supported by the per-packet metadata export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
 pub enum DumpFormat {
+    /// Comma-separated values with one header row.
     Csv,
+    /// Apache Parquet with one row group per flushed batch.
     Parquet,
 }
 
+/// Metadata extracted from one successfully parsed packet.
 #[derive(Debug, Default)]
 pub struct PacketMetadata {
     pub timestamp: i64,
@@ -33,6 +39,9 @@ pub struct PacketMetadata {
     pub udp_length: Option<u16>,
 }
 
+/// Column-oriented packet buffer converted into one Polars `DataFrame` batch.
+///
+/// Its vectors never exceed the configured batch size.
 #[derive(Debug, Default)]
 struct PacketMetadataBatch {
     timestamp: Vec<i64>,
@@ -117,6 +126,7 @@ impl PacketMetadataBatch {
     }
 }
 
+/// Type-erased adapter over the Polars CSV and Parquet batched writers.
 enum BatchWriter {
     Csv(Box<polars::io::csv::write::BatchedWriter<File>>),
     Parquet(Box<polars::io::parquet::write::BatchedWriter<File>>),
@@ -138,12 +148,14 @@ impl BatchWriter {
     }
 }
 
+/// Description and measured write time of a completed metadata export.
 pub struct DumpResult {
     pub path: PathBuf,
     pub format: DumpFormat,
     pub elapsed: Duration,
 }
 
+/// Packet metadata exporter.
 pub struct MetadataDumper {
     writer: BatchWriter,
     batch: PacketMetadataBatch,

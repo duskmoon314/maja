@@ -88,6 +88,10 @@ impl RunningLengthStats {
     }
 }
 
+/// Exact statistics accumulated while packets are read from one capture.
+///
+/// Per-key maps provide both unique counts and top-traffic candidates. Their
+/// memory use is proportional to the number of distinct keys, not packet count.
 #[derive(Debug)]
 pub struct Stats {
     pub total_packets: u64,
