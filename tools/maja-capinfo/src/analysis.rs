@@ -1,7 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    net::{IpAddr, Ipv4Addr},
+};
 
 use itertools::Itertools;
-use maja::packet::flow::FlowIdSymmetric;
+use maja::packet::{flow::FlowIdSymmetric, layer::ip::protocol::IpProtocol};
 
 use crate::metadata::PacketMetadata;
 
@@ -183,6 +186,10 @@ impl Stats {
             Some(17) => self.udp_count += 1,
             _ => {}
         }
+
+        if let Some(flow) = flow_id(metadata) {
+            self.flow_set.insert(flow);
+        }
     }
 
     pub fn unique_src_ips(&self) -> usize {
@@ -215,6 +222,23 @@ impl Stats {
 
     pub fn top_dst_ports(&self, limit: usize) -> Vec<(u16, RunningTrafficStats)> {
         top_items(&self.dst_port_traffic, limit)
+    }
+}
+
+pub(crate) fn flow_id(metadata: &PacketMetadata) -> Option<FlowIdSymmetric> {
+    let src_ip = IpAddr::V4(Ipv4Addr::from(metadata.src_ip4?));
+    let dst_ip = IpAddr::V4(Ipv4Addr::from(metadata.dst_ip4?));
+    let protocol = IpProtocol::from(metadata.ip_proto?);
+
+    match protocol {
+        IpProtocol::Tcp | IpProtocol::Udp => Some(FlowIdSymmetric::new((
+            src_ip,
+            dst_ip,
+            metadata.src_port?,
+            metadata.dst_port?,
+            protocol,
+        ))),
+        _ => Some(FlowIdSymmetric::new((src_ip, dst_ip, protocol))),
     }
 }
 
@@ -273,6 +297,41 @@ mod tests {
         stats.update_with_packet(2, 64);
         stats.update_with_packet(1, 64);
         assert!(!stats.is_ordered);
+    }
+
+    #[test]
+    fn non_transport_protocols_use_symmetric_three_tuples() {
+        let forward = PacketMetadata {
+            src_ip4: Some(u32::from(Ipv4Addr::new(192, 0, 2, 1))),
+            dst_ip4: Some(u32::from(Ipv4Addr::new(198, 51, 100, 2))),
+            ip_proto: Some(u8::from(IpProtocol::Icmp)),
+            ..Default::default()
+        };
+        let reverse = PacketMetadata {
+            src_ip4: forward.dst_ip4,
+            dst_ip4: forward.src_ip4,
+            ..forward
+        };
+        let expected = FlowIdSymmetric::new((
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)),
+            IpProtocol::Icmp,
+        ));
+
+        assert_eq!(flow_id(&forward), Some(expected.clone()));
+        assert_eq!(flow_id(&reverse), Some(expected));
+    }
+
+    #[test]
+    fn transport_protocols_without_ports_are_not_counted_as_flows() {
+        let metadata = PacketMetadata {
+            src_ip4: Some(u32::from(Ipv4Addr::new(192, 0, 2, 1))),
+            dst_ip4: Some(u32::from(Ipv4Addr::new(198, 51, 100, 2))),
+            ip_proto: Some(u8::from(IpProtocol::Tcp)),
+            ..Default::default()
+        };
+
+        assert_eq!(flow_id(&metadata), None);
     }
 
     #[test]

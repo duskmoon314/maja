@@ -12,7 +12,7 @@ cargo install maja-capinfo
 
 ```bash
 $ maja-capinfo -h
-maja-capinfo
+A CLI tool to print information about capture files.
 
 Usage: maja-capinfo [OPTIONS] [INPUTS]...
 
@@ -20,14 +20,16 @@ Arguments:
   [INPUTS]...  Input capture files
 
 Options:
-  -d, --dump <DUMP>      Whether to dump the inner metadata of all packets in the capture file [possible values: csv, parquet]
-  -o, --output <OUTPUT>  The output directory for generated files. If not specified, the input directory is used
-  -k, --top-k <TOP_K>    The number of top items to display in the statistics [default: 10]
+  -d, --dump <DUMP>              Whether to dump the inner metadata of all packets in the capture file [possible values: csv, parquet]
+  -o, --output <OUTPUT>          The output directory for generated files. If not specified, the input directory is used
+  -k, --top-k <TOP_K>            The number of top items to display in the statistics [default: 10]
       --batch-size <BATCH_SIZE>  The maximum number of packet metadata rows buffered before a dump batch is written [default: 65536]
-      --format <FORMAT>  Report output format [default: text] [possible values: text, json, toml, yaml]
-      --report-file      Write each report to a file instead of stdout
-  -h, --help             Print help (see more with '--help')
-  -V, --version          Print version
+      --format <FORMAT>          Report output format [default: text] [possible values: text, json, toml, yaml]
+      --report-file              Write each report to a file instead of stdout
+      --interval-stats <FORMAT>  Export exact per-interval statistics [possible values: csv, parquet]
+      --interval <DURATION>      Width of exported statistics intervals [default: 1s]
+  -h, --help                     Print help (see more with '--help')
+  -V, --version                  Print version
 ```
 
 ## Structured reports
@@ -50,6 +52,26 @@ units in field names. A single JSON report is pretty-printed. With multiple
 inputs, JSON uses one compact object per line, YAML uses a document stream, and
 TOML uses a `[[reports]]` array of tables. A single TOML report is a standalone
 document.
+
+## Interval statistics
+
+Export exact statistics for each nonempty time interval to a separate file:
+
+```bash
+maja-capinfo --interval-stats csv capture.pcap
+# capture.intervals.csv
+
+maja-capinfo --interval-stats parquet --interval 500ms capture.pcap
+# capture.intervals.parquet
+```
+
+The interval defaults to one second and accepts time suffixes such as `ns`,
+`ms`, `s`, `m`, and `h`. Intervals are aligned to Unix epoch boundaries and
+written chronologically, including for captures with unordered packet
+timestamps. Each row reports packet and L2 byte totals, pps, Bps, unique source
+and destination IPv4 values, and unique symmetric flows. TCP and UDP flows use
+5-tuples; other IP protocols use 3-tuples of addresses and protocol. Empty
+intervals are omitted. `--output` controls the artifact directory.
 
 Use Wireshark's [vlan.cap](https://wiki.wireshark.org/uploads/__moin_import__/attachments/SampleCaptures/vlan.cap.gz) as an example:
 
@@ -85,7 +107,7 @@ Aggregated Statistics:
   UDP Count:        15
   Unique SRC Ports: 7
   Unique DST Ports: 7
-  Unique 5-tuple:   15
+  Unique flows:     15
 
 Top10 Statistics:
   Top 10 SRC IPs:

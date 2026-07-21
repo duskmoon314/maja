@@ -1,32 +1,22 @@
 use std::{
     fs::File,
     io::Write,
-    num::NonZeroUsize,
+    num::{NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use clap::{Args, Parser};
 use log::{debug, error, info};
-use maja::{
-    capture::CaptureReader,
-    packet::{
-        flow::FlowIdSymmetric,
-        layer::{
-            eth::Eth,
-            ip::{protocol::IpProtocol, v4::Ipv4},
-            sll::Sll,
-            tcp::Tcp,
-            udp::Udp,
-        },
-    },
-};
+use maja::{packet::layer::sll::Sll, prelude::*};
 
 mod analysis;
+mod interval;
 mod metadata;
 mod report;
 
 use analysis::Stats;
+use interval::{IntervalStats, write_interval_stats};
 use metadata::{DumpFormat, MetadataDumper, PacketMetadata};
 use report::{CaptureReport, FileReport, ReportFormat, write_reports};
 
@@ -69,6 +59,44 @@ struct Flags {
     /// Write each report to a file instead of stdout
     #[arg(long)]
     report_file: bool,
+
+    /// Export exact per-interval statistics
+    #[arg(long, value_enum, value_name = "FORMAT")]
+    interval_stats: Option<DumpFormat>,
+
+    /// Width of exported statistics intervals
+    #[arg(
+        long,
+        value_name = "DURATION",
+        value_parser = parse_interval,
+        default_value = "1s",
+        requires = "interval_stats"
+    )]
+    interval: NonZeroU64,
+}
+
+fn parse_interval(value: &str) -> Result<NonZeroU64, String> {
+    let mut formatter = human_format::Formatter::new();
+    formatter.with_scales(human_format::Scales::Time());
+    let seconds = formatter
+        .try_parse(value)
+        .map_err(|error| format!("invalid duration: {error}"))?;
+    let nanoseconds = seconds * 1_000_000_000.0;
+
+    if !nanoseconds.is_finite() || nanoseconds < 1.0 {
+        return Err("duration must be at least 1ns".to_string());
+    }
+    if nanoseconds >= i64::MAX as f64 {
+        return Err("duration is too large".to_string());
+    }
+
+    let rounded = nanoseconds.round();
+    let tolerance = (nanoseconds.abs() * f64::EPSILON * 4.0).max(1e-6);
+    if (nanoseconds - rounded).abs() > tolerance {
+        return Err("duration must resolve to a whole number of nanoseconds".to_string());
+    }
+
+    NonZeroU64::new(rounded as u64).ok_or_else(|| "duration must be positive".to_string())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -143,6 +171,9 @@ fn analyze(
 
     let start = Instant::now();
     let mut stats = Stats::default();
+    let mut interval_stats = args
+        .interval_stats
+        .map(|_| IntervalStats::new(args.interval));
 
     loop {
         pg.inc(1);
@@ -161,6 +192,9 @@ fn analyze(
         };
 
         stats.update_with_packet(packet.timestamp, packet.original_length);
+        if let Some(interval_stats) = &mut interval_stats {
+            interval_stats.update_with_packet(packet.timestamp, packet.original_length);
+        }
 
         metadata.timestamp = packet.timestamp;
         metadata.length = packet.original_length;
@@ -201,41 +235,44 @@ fn analyze(
                 metadata.tcp_flags = Some(tcp.flags().raw());
                 metadata.tcp_window = Some(tcp.window_size().get());
                 metadata.tcp_data_offset = Some(tcp.data_offset().get());
-
-                stats.flow_set.insert(FlowIdSymmetric::new((
-                    ipv4.src().get(),
-                    ipv4.dst().get(),
-                    tcp.src_port().get(),
-                    tcp.dst_port().get(),
-                    IpProtocol::Tcp,
-                )));
             } else if let Some(udp) = packet.layer_viewer(Udp) {
                 metadata.src_port = Some(udp.src_port().raw());
                 metadata.dst_port = Some(udp.dst_port().raw());
                 metadata.udp_length = Some(udp.length().get());
-
-                stats.flow_set.insert(FlowIdSymmetric::new((
-                    ipv4.src().get(),
-                    ipv4.dst().get(),
-                    udp.src_port().get(),
-                    udp.dst_port().get(),
-                    IpProtocol::Udp,
-                )));
             }
         }
 
         stats.update_with_metadata(&metadata);
+        if let Some(interval_stats) = &mut interval_stats {
+            interval_stats.update_with_metadata(&metadata);
+        }
         if let Some(dumper) = &mut dumper {
             dumper.push(metadata)?;
         }
     }
 
+    let interval_export = match (&interval_stats, args.interval_stats) {
+        (Some(stats), Some(format)) => Some(write_interval_stats(
+            stats,
+            interval_path(file_path, args.output.as_deref(), format),
+            format,
+        )?),
+        _ => None,
+    };
+    if let Some(export) = &interval_export {
+        info!("Interval statistics written to {}", export.path.display());
+    }
+
     let dump_result = dumper.map(MetadataDumper::finish).transpose()?;
-    let processing_time = start.elapsed().saturating_sub(
-        dump_result
-            .as_ref()
-            .map_or(Duration::ZERO, |result| result.elapsed),
-    );
+    let export_time = dump_result
+        .as_ref()
+        .map_or(Duration::ZERO, |result| result.elapsed)
+        .saturating_add(
+            interval_export
+                .as_ref()
+                .map_or(Duration::ZERO, |result| result.elapsed),
+        );
+    let processing_time = start.elapsed().saturating_sub(export_time);
 
     pg.finish_and_clear();
 
@@ -254,15 +291,17 @@ fn analyze(
 }
 
 fn dump_path(file_path: &Path, output: Option<&Path>, format: DumpFormat) -> PathBuf {
-    let extension = match format {
-        DumpFormat::Csv => "csv",
-        DumpFormat::Parquet => "parquet",
-    };
-
     output
         .map(|directory| directory.join(file_path.file_name().expect("Invalid input file name")))
         .unwrap_or_else(|| file_path.to_path_buf())
-        .with_extension(extension)
+        .with_extension(format.extension())
+}
+
+fn interval_path(file_path: &Path, output: Option<&Path>, format: DumpFormat) -> PathBuf {
+    output
+        .map(|directory| directory.join(file_path.file_name().expect("Invalid input file name")))
+        .unwrap_or_else(|| file_path.to_path_buf())
+        .with_extension(format!("intervals.{}", format.extension()))
 }
 
 fn report_path(file_path: &Path, output: Option<&Path>, extension: &str) -> PathBuf {
@@ -289,4 +328,51 @@ fn write_report_file(
     tempfile.persist(path)?;
     info!("Report written to {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interval_parser_accepts_time_suffixes() {
+        assert_eq!(parse_interval("1s").unwrap().get(), 1_000_000_000);
+        assert_eq!(parse_interval("500ms").unwrap().get(), 500_000_000);
+        assert_eq!(parse_interval("1.5m").unwrap().get(), 90_000_000_000);
+    }
+
+    #[test]
+    fn interval_parser_rejects_invalid_durations() {
+        assert!(parse_interval("0s").is_err());
+        assert!(parse_interval("0.5ns").is_err());
+        assert!(parse_interval("1fortnight").is_err());
+    }
+
+    #[test]
+    fn interval_export_is_optional_and_interval_requires_it() {
+        let cli = Cli::try_parse_from(["maja-capinfo"]).unwrap();
+        assert_eq!(cli.flags.interval_stats, None);
+        assert_eq!(cli.flags.interval.get(), 1_000_000_000);
+
+        let cli = Cli::try_parse_from(["maja-capinfo", "--interval-stats", "csv"]).unwrap();
+        assert_eq!(cli.flags.interval_stats, Some(DumpFormat::Csv));
+        assert_eq!(cli.flags.interval.get(), 1_000_000_000);
+
+        assert!(Cli::try_parse_from(["maja-capinfo", "--interval", "500ms"]).is_err());
+    }
+
+    #[test]
+    fn interval_output_path_is_distinct_from_metadata_dump() {
+        let capture = Path::new("captures/input.pcap");
+        let output = Path::new("exports");
+
+        assert_eq!(
+            interval_path(capture, Some(output), DumpFormat::Csv),
+            Path::new("exports/input.intervals.csv")
+        );
+        assert_eq!(
+            dump_path(capture, Some(output), DumpFormat::Csv),
+            Path::new("exports/input.csv")
+        );
+    }
 }

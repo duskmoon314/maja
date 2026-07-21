@@ -126,7 +126,10 @@ pub struct AggregatedStatistics {
     pub unique_src_ports: usize,
     /// Count of unique destination transport ports observed in the capture.
     pub unique_dst_ports: usize,
-    /// Count of unique 5-tuple flows observed in the capture.
+    /// Count of unique symmetric flows observed in the capture.
+    ///
+    /// TCP and UDP use 5-tuples; other IP protocols use 3-tuples containing
+    /// the source address, destination address, and protocol.
     pub unique_flows: usize,
 }
 
@@ -355,7 +358,7 @@ impl CaptureReport {
             "  Unique DST Ports: {}",
             aggregated.unique_dst_ports
         )?;
-        writeln!(writer, "  Unique 5-tuple:   {}", aggregated.unique_flows)?;
+        writeln!(writer, "  Unique flows:     {}", aggregated.unique_flows)?;
 
         let top = &self.top_statistics;
         writeln!(writer, "\nTop{} Statistics:", top.limit)?;

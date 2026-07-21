@@ -15,8 +15,17 @@ use tempfile::TempPath;
 pub enum DumpFormat {
     /// Comma-separated values with one header row.
     Csv,
-    /// Apache Parquet with one row group per flushed batch.
+    /// Apache Parquet.
     Parquet,
+}
+
+impl DumpFormat {
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Csv => "csv",
+            Self::Parquet => "parquet",
+        }
+    }
 }
 
 /// Metadata extracted from one successfully parsed packet.
