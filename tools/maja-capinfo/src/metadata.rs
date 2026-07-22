@@ -1,5 +1,6 @@
 use std::{
     fs::File,
+    net::IpAddr,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -34,8 +35,8 @@ pub struct PacketMetadata {
     pub timestamp: i64,
     pub length: u32,
     pub eth_type: u16,
-    pub src_ip4: Option<u32>,
-    pub dst_ip4: Option<u32>,
+    pub src_ip: Option<IpAddr>,
+    pub dst_ip: Option<IpAddr>,
     pub ip_proto: Option<u8>,
     pub tos: Option<u8>,
     pub ttl: Option<u8>,
@@ -46,6 +47,7 @@ pub struct PacketMetadata {
     pub tcp_window: Option<u16>,
     pub tcp_data_offset: Option<u8>,
     pub udp_length: Option<u16>,
+    pub ipv6_payload_length: Option<u16>,
 }
 
 /// Column-oriented packet buffer converted into one Polars `DataFrame` batch.
@@ -56,8 +58,8 @@ struct PacketMetadataBatch {
     timestamp: Vec<i64>,
     length: Vec<u32>,
     eth_type: Vec<u16>,
-    src_ip4: Vec<u32>,
-    dst_ip4: Vec<u32>,
+    src_ip: Vec<Option<String>>,
+    dst_ip: Vec<Option<String>>,
     ip_proto: Vec<u8>,
     tos: Vec<u8>,
     ttl: Vec<u8>,
@@ -68,6 +70,7 @@ struct PacketMetadataBatch {
     tcp_window: Vec<u16>,
     tcp_data_offset: Vec<u8>,
     udp_length: Vec<u16>,
+    ipv6_payload_length: Vec<u16>,
 }
 
 impl PacketMetadataBatch {
@@ -76,8 +79,8 @@ impl PacketMetadataBatch {
             timestamp: Vec::with_capacity(capacity),
             length: Vec::with_capacity(capacity),
             eth_type: Vec::with_capacity(capacity),
-            src_ip4: Vec::with_capacity(capacity),
-            dst_ip4: Vec::with_capacity(capacity),
+            src_ip: Vec::with_capacity(capacity),
+            dst_ip: Vec::with_capacity(capacity),
             ip_proto: Vec::with_capacity(capacity),
             tos: Vec::with_capacity(capacity),
             ttl: Vec::with_capacity(capacity),
@@ -88,6 +91,7 @@ impl PacketMetadataBatch {
             tcp_window: Vec::with_capacity(capacity),
             tcp_data_offset: Vec::with_capacity(capacity),
             udp_length: Vec::with_capacity(capacity),
+            ipv6_payload_length: Vec::with_capacity(capacity),
         }
     }
 
@@ -99,8 +103,10 @@ impl PacketMetadataBatch {
         self.timestamp.push(metadata.timestamp);
         self.length.push(metadata.length);
         self.eth_type.push(metadata.eth_type);
-        self.src_ip4.push(metadata.src_ip4.unwrap_or(0));
-        self.dst_ip4.push(metadata.dst_ip4.unwrap_or(0));
+        self.src_ip
+            .push(metadata.src_ip.map(|address| address.to_string()));
+        self.dst_ip
+            .push(metadata.dst_ip.map(|address| address.to_string()));
         self.ip_proto.push(metadata.ip_proto.unwrap_or(0));
         self.tos.push(metadata.tos.unwrap_or(0));
         self.ttl.push(metadata.ttl.unwrap_or(0));
@@ -112,6 +118,8 @@ impl PacketMetadataBatch {
         self.tcp_data_offset
             .push(metadata.tcp_data_offset.unwrap_or(0));
         self.udp_length.push(metadata.udp_length.unwrap_or(0));
+        self.ipv6_payload_length
+            .push(metadata.ipv6_payload_length.unwrap_or(0));
     }
 
     fn into_dataframe(self) -> PolarsResult<DataFrame> {
@@ -119,8 +127,8 @@ impl PacketMetadataBatch {
             "timestamp" => self.timestamp,
             "length" => self.length,
             "eth_type" => self.eth_type,
-            "src_ip4" => self.src_ip4,
-            "dst_ip4" => self.dst_ip4,
+            "src_ip" => self.src_ip,
+            "dst_ip" => self.dst_ip,
             "ip_proto" => self.ip_proto,
             "tos" => self.tos,
             "ttl" => self.ttl,
@@ -130,7 +138,8 @@ impl PacketMetadataBatch {
             "tcp_flags" => self.tcp_flags,
             "tcp_window" => self.tcp_window,
             "tcp_data_offset" => self.tcp_data_offset,
-            "udp_length" => self.udp_length
+            "udp_length" => self.udp_length,
+            "ipv6_payload_length" => self.ipv6_payload_length,
         )
     }
 }
@@ -277,7 +286,7 @@ mod tests {
         PacketMetadata {
             timestamp,
             length: 64,
-            src_ip4: Some(timestamp as u32),
+            src_ip: Some(IpAddr::V4(std::net::Ipv4Addr::from(timestamp as u32))),
             ..Default::default()
         }
     }
@@ -315,6 +324,41 @@ mod tests {
 
         let dataframe = ParquetReader::new(File::open(output)?).finish()?;
         assert_eq!(dataframe.height(), 5);
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_dump_uses_canonical_ipv6_addresses() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let output = dir.path().join("packets.csv");
+        let mut dumper = MetadataDumper::new(output.clone(), DumpFormat::Csv, 1)?;
+        dumper.push(PacketMetadata {
+            timestamp: 1,
+            src_ip: Some("2001:db8::1".parse()?),
+            dst_ip: Some("::1".parse()?),
+            tos: Some(42),
+            ttl: Some(64),
+            ..Default::default()
+        })?;
+        dumper.finish()?;
+
+        let contents = std::fs::read_to_string(output)?;
+        assert!(contents.contains("src_ip,dst_ip,ip_proto"));
+        assert!(contents.contains("2001:db8::1,::1"));
+        Ok(())
+    }
+
+    #[test]
+    fn parquet_dump_preserves_missing_ips_as_null() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let output = dir.path().join("packets.parquet");
+        let mut dumper = MetadataDumper::new(output.clone(), DumpFormat::Parquet, 1)?;
+        dumper.push(PacketMetadata::default())?;
+        dumper.finish()?;
+
+        let dataframe = ParquetReader::new(File::open(output)?).finish()?;
+        assert_eq!(dataframe.column("src_ip")?.str()?.get(0), None);
+        assert_eq!(dataframe.column("dst_ip")?.str()?.get(0), None);
         Ok(())
     }
 }

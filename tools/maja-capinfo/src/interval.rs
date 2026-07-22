@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashSet},
     io::Write,
+    net::IpAddr,
     num::NonZeroU64,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -19,8 +20,8 @@ use crate::{
 struct IntervalBucket {
     total_packets: u64,
     total_l2_bytes: u64,
-    src_ips: HashSet<u32>,
-    dst_ips: HashSet<u32>,
+    src_ips: HashSet<IpAddr>,
+    dst_ips: HashSet<IpAddr>,
     flows: HashSet<FlowIdSymmetric>,
 }
 
@@ -67,8 +68,12 @@ impl IntervalStats {
 
     pub fn update_with_metadata(&mut self, metadata: &PacketMetadata) {
         let bucket = self.bucket_mut(metadata.timestamp);
-        bucket.src_ips.insert(metadata.src_ip4.unwrap_or(0));
-        bucket.dst_ips.insert(metadata.dst_ip4.unwrap_or(0));
+        if let Some(src_ip) = metadata.src_ip {
+            bucket.src_ips.insert(src_ip);
+        }
+        if let Some(dst_ip) = metadata.dst_ip {
+            bucket.dst_ips.insert(dst_ip);
+        }
         if let Some(flow) = flow_id(metadata) {
             bucket.flows.insert(flow);
         }
@@ -177,7 +182,8 @@ fn output_directory(path: &Path) -> &Path {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs::File, net::Ipv4Addr};
+    use maja::packet::layer::ip::protocol::IpProtocol;
+    use std::{fs::File, net::Ipv4Addr, net::Ipv6Addr};
 
     fn stats() -> IntervalStats {
         let mut stats = IntervalStats::new(NonZeroU64::new(1_000_000_000).unwrap());
@@ -228,8 +234,8 @@ mod tests {
         for metadata in [
             PacketMetadata {
                 timestamp: 1,
-                src_ip4: Some(u32::from(Ipv4Addr::new(192, 0, 2, 1))),
-                dst_ip4: Some(u32::from(Ipv4Addr::new(198, 51, 100, 2))),
+                src_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+                dst_ip: Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))),
                 ip_proto: Some(6),
                 src_port: Some(1_234),
                 dst_port: Some(80),
@@ -237,8 +243,8 @@ mod tests {
             },
             PacketMetadata {
                 timestamp: 2,
-                src_ip4: Some(u32::from(Ipv4Addr::new(198, 51, 100, 2))),
-                dst_ip4: Some(u32::from(Ipv4Addr::new(192, 0, 2, 1))),
+                src_ip: Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))),
+                dst_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
                 ip_proto: Some(6),
                 src_port: Some(80),
                 dst_port: Some(1_234),
@@ -252,6 +258,25 @@ mod tests {
         let bucket = stats.snapshots().next().unwrap();
         assert_eq!(bucket.unique_src_ips, 2);
         assert_eq!(bucket.unique_dst_ips, 2);
+        assert_eq!(bucket.unique_flows, 1);
+    }
+
+    #[test]
+    fn interval_stats_count_ipv6_endpoints_and_flows() {
+        let mut stats = IntervalStats::new(NonZeroU64::new(1_000_000_000).unwrap());
+        let metadata = PacketMetadata {
+            timestamp: 1,
+            src_ip: Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            dst_ip: Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
+            ip_proto: Some(u8::from(IpProtocol::Ipv6Icmp)),
+            ..Default::default()
+        };
+        stats.update_with_packet(metadata.timestamp, 64);
+        stats.update_with_metadata(&metadata);
+
+        let bucket = stats.snapshots().next().unwrap();
+        assert_eq!(bucket.unique_src_ips, 1);
+        assert_eq!(bucket.unique_dst_ips, 1);
         assert_eq!(bucket.unique_flows, 1);
     }
 

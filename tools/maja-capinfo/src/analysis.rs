@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::{IpAddr, Ipv4Addr},
+    net::IpAddr,
 };
 
 use itertools::Itertools;
@@ -109,8 +109,8 @@ pub struct Stats {
     pub tcp_count: u64,
     pub udp_count: u64,
     pub flow_set: HashSet<FlowIdSymmetric>,
-    src_ip_traffic: HashMap<u32, RunningTrafficStats>,
-    dst_ip_traffic: HashMap<u32, RunningTrafficStats>,
+    src_ip_traffic: HashMap<IpAddr, RunningTrafficStats>,
+    dst_ip_traffic: HashMap<IpAddr, RunningTrafficStats>,
     src_port_traffic: HashMap<u16, RunningTrafficStats>,
     dst_port_traffic: HashMap<u16, RunningTrafficStats>,
 }
@@ -158,20 +158,22 @@ impl Stats {
     }
 
     pub fn update_with_metadata(&mut self, metadata: &PacketMetadata) {
-        let src_ip = metadata.src_ip4.unwrap_or(0);
-        let dst_ip = metadata.dst_ip4.unwrap_or(0);
         let src_port = metadata.src_port.unwrap_or(0);
         let dst_port = metadata.dst_port.unwrap_or(0);
 
         self.lengths.update(metadata.length);
-        self.src_ip_traffic
-            .entry(src_ip)
-            .or_default()
-            .update(metadata.length);
-        self.dst_ip_traffic
-            .entry(dst_ip)
-            .or_default()
-            .update(metadata.length);
+        if let Some(src_ip) = metadata.src_ip {
+            self.src_ip_traffic
+                .entry(src_ip)
+                .or_default()
+                .update(metadata.length);
+        }
+        if let Some(dst_ip) = metadata.dst_ip {
+            self.dst_ip_traffic
+                .entry(dst_ip)
+                .or_default()
+                .update(metadata.length);
+        }
         self.src_port_traffic
             .entry(src_port)
             .or_default()
@@ -208,11 +210,11 @@ impl Stats {
         self.dst_port_traffic.len()
     }
 
-    pub fn top_src_ips(&self, limit: usize) -> Vec<(u32, RunningTrafficStats)> {
+    pub fn top_src_ips(&self, limit: usize) -> Vec<(IpAddr, RunningTrafficStats)> {
         top_items(&self.src_ip_traffic, limit)
     }
 
-    pub fn top_dst_ips(&self, limit: usize) -> Vec<(u32, RunningTrafficStats)> {
+    pub fn top_dst_ips(&self, limit: usize) -> Vec<(IpAddr, RunningTrafficStats)> {
         top_items(&self.dst_ip_traffic, limit)
     }
 
@@ -226,8 +228,8 @@ impl Stats {
 }
 
 pub(crate) fn flow_id(metadata: &PacketMetadata) -> Option<FlowIdSymmetric> {
-    let src_ip = IpAddr::V4(Ipv4Addr::from(metadata.src_ip4?));
-    let dst_ip = IpAddr::V4(Ipv4Addr::from(metadata.dst_ip4?));
+    let src_ip = metadata.src_ip?;
+    let dst_ip = metadata.dst_ip?;
     let protocol = IpProtocol::from(metadata.ip_proto?);
 
     match protocol {
@@ -264,6 +266,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn running_stats_match_sample_statistics() {
@@ -300,16 +303,27 @@ mod tests {
     }
 
     #[test]
+    fn non_ip_metadata_does_not_create_endpoints() {
+        let mut stats = Stats::default();
+        stats.update_with_metadata(&PacketMetadata::default());
+
+        assert_eq!(stats.unique_src_ips(), 0);
+        assert_eq!(stats.unique_dst_ips(), 0);
+        assert!(stats.top_src_ips(1).is_empty());
+        assert!(stats.top_dst_ips(1).is_empty());
+    }
+
+    #[test]
     fn non_transport_protocols_use_symmetric_three_tuples() {
         let forward = PacketMetadata {
-            src_ip4: Some(u32::from(Ipv4Addr::new(192, 0, 2, 1))),
-            dst_ip4: Some(u32::from(Ipv4Addr::new(198, 51, 100, 2))),
+            src_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+            dst_ip: Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))),
             ip_proto: Some(u8::from(IpProtocol::Icmp)),
             ..Default::default()
         };
         let reverse = PacketMetadata {
-            src_ip4: forward.dst_ip4,
-            dst_ip4: forward.src_ip4,
+            src_ip: forward.dst_ip,
+            dst_ip: forward.src_ip,
             ..forward
         };
         let expected = FlowIdSymmetric::new((
@@ -325,13 +339,41 @@ mod tests {
     #[test]
     fn transport_protocols_without_ports_are_not_counted_as_flows() {
         let metadata = PacketMetadata {
-            src_ip4: Some(u32::from(Ipv4Addr::new(192, 0, 2, 1))),
-            dst_ip4: Some(u32::from(Ipv4Addr::new(198, 51, 100, 2))),
+            src_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))),
+            dst_ip: Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2))),
             ip_proto: Some(u8::from(IpProtocol::Tcp)),
             ..Default::default()
         };
 
         assert_eq!(flow_id(&metadata), None);
+    }
+
+    #[test]
+    fn ipv6_transport_flows_are_symmetric() {
+        let src = Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 1);
+        let dst = Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 2);
+        let forward = PacketMetadata {
+            src_ip: Some(IpAddr::V6(src)),
+            dst_ip: Some(IpAddr::V6(dst)),
+            ip_proto: Some(u8::from(IpProtocol::Tcp)),
+            src_port: Some(12_345),
+            dst_port: Some(443),
+            ..Default::default()
+        };
+        let reverse = PacketMetadata {
+            src_ip: forward.dst_ip,
+            dst_ip: forward.src_ip,
+            src_port: forward.dst_port,
+            dst_port: forward.src_port,
+            ..forward
+        };
+
+        assert_eq!(flow_id(&forward), flow_id(&reverse));
+
+        let mut stats = Stats::default();
+        stats.update_with_metadata(&forward);
+        assert_eq!(stats.top_src_ips(1)[0].0, IpAddr::V6(src));
+        assert_eq!(stats.top_dst_ips(1)[0].0, IpAddr::V6(dst));
     }
 
     #[test]

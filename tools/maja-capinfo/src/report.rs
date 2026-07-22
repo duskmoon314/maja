@@ -1,4 +1,4 @@
-use std::{io::Write, path::Path, time::Duration};
+use std::{io::Write, net::IpAddr, path::Path, time::Duration};
 
 use clap::ValueEnum;
 use maja::capture::{CaptureFormat, interface::Interface};
@@ -152,7 +152,7 @@ pub struct TopStatistics {
     pub dst_ports: Vec<PortTraffic>,
 }
 
-/// Packet and byte totals associated with an IPv4 address.
+/// Packet and byte totals associated with an IP address.
 #[derive(Debug, Serialize)]
 pub struct IpTraffic {
     pub address: String,
@@ -361,6 +361,12 @@ impl CaptureReport {
         writeln!(writer, "  Unique flows:     {}", aggregated.unique_flows)?;
 
         let top = &self.top_statistics;
+        let ip_column_width = traffic_key_width(
+            top.src_ips
+                .iter()
+                .chain(&top.dst_ips)
+                .map(|value| value.address.as_str()),
+        );
         writeln!(writer, "\nTop{} Statistics:", top.limit)?;
         writeln!(writer, "  Top {} SRC IPs:", top.limit)?;
         for value in &top.src_ips {
@@ -368,6 +374,7 @@ impl CaptureReport {
                 &mut writer,
                 &humanize,
                 &value.address,
+                ip_column_width,
                 value.packets,
                 value.bytes,
             )?;
@@ -378,6 +385,7 @@ impl CaptureReport {
                 &mut writer,
                 &humanize,
                 &value.address,
+                ip_column_width,
                 value.packets,
                 value.bytes,
             )?;
@@ -388,6 +396,7 @@ impl CaptureReport {
                 &mut writer,
                 &humanize,
                 &value.port.to_string(),
+                15,
                 value.packets,
                 value.bytes,
             )?;
@@ -398,6 +407,7 @@ impl CaptureReport {
                 &mut writer,
                 &humanize,
                 &value.port.to_string(),
+                15,
                 value.packets,
                 value.bytes,
             )?;
@@ -493,11 +503,11 @@ fn rate(total: u64, duration_seconds: f64) -> f64 {
     }
 }
 
-fn ip_traffic(values: Vec<(u32, RunningTrafficStats)>) -> Vec<IpTraffic> {
+fn ip_traffic(values: Vec<(IpAddr, RunningTrafficStats)>) -> Vec<IpTraffic> {
     values
         .into_iter()
         .map(|(address, traffic)| IpTraffic {
-            address: std::net::Ipv4Addr::from(address).to_string(),
+            address: address.to_string(),
             packets: traffic.count,
             bytes: traffic.bytes,
         })
@@ -525,15 +535,20 @@ fn write_traffic_line(
     writer: &mut impl Write,
     humanize: &human_format::Formatter,
     key: &str,
+    key_width: usize,
     packets: u64,
     bytes: u64,
 ) -> std::io::Result<()> {
     writeln!(
         writer,
-        "    {key:<15} {:>8}pkts, {:>8}B",
+        "    {key:<key_width$} {:>8}pkts, {:>8}B",
         humanize.format(packets as f64),
         humanize.format(bytes as f64)
     )
+}
+
+fn traffic_key_width<'a>(keys: impl Iterator<Item = &'a str>) -> usize {
+    keys.map(str::len).max().unwrap_or(15).max(15)
 }
 
 #[cfg(test)]
@@ -648,5 +663,15 @@ mod tests {
         assert!(text.contains("First packet:     N/A"));
         assert!(!text.contains("NaN"));
         Ok(())
+    }
+
+    #[test]
+    fn traffic_key_width_expands_for_ipv6() {
+        let longest = "3ffe:501:410:0:2c0:dfff:fe47:33e";
+        assert_eq!(traffic_key_width(["192.0.2.1"].into_iter()), 15);
+        assert_eq!(
+            traffic_key_width([longest, "2001:db8::1"].into_iter()),
+            longest.len()
+        );
     }
 }

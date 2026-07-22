@@ -1,6 +1,7 @@
 use std::{
     fs::File,
     io::Write,
+    net::IpAddr,
     num::{NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -8,7 +9,10 @@ use std::{
 
 use clap::{Args, Parser};
 use log::{debug, error, info};
-use maja::{packet::layer::sll::Sll, prelude::*};
+use maja::{
+    packet::layer::{ip::v6::Ipv6, sll::Sll},
+    prelude::*,
+};
 
 mod analysis;
 mod interval;
@@ -213,34 +217,7 @@ fn analyze(
             continue;
         }
 
-        if let Some(eth) = packet.layer_viewer(Eth) {
-            metadata.eth_type = eth.eth_type().raw();
-        } else if let Some(sll) = packet.layer_viewer(Sll) {
-            metadata.eth_type = sll.protocol_type().raw();
-        }
-
-        if let Some(ipv4) = packet.layer_viewer(Ipv4) {
-            stats.total_l3_bytes += ipv4.total_length().get() as u64;
-
-            metadata.src_ip4 = Some(ipv4.src().raw());
-            metadata.dst_ip4 = Some(ipv4.dst().raw());
-            metadata.ip_proto = Some(ipv4.protocol().raw());
-            metadata.tos = Some(ipv4.tos().raw());
-            metadata.ttl = Some(ipv4.ttl().raw());
-            metadata.total_length = Some(ipv4.total_length().get());
-
-            if let Some(tcp) = packet.layer_viewer(Tcp) {
-                metadata.src_port = Some(tcp.src_port().raw());
-                metadata.dst_port = Some(tcp.dst_port().raw());
-                metadata.tcp_flags = Some(tcp.flags().raw());
-                metadata.tcp_window = Some(tcp.window_size().get());
-                metadata.tcp_data_offset = Some(tcp.data_offset().get());
-            } else if let Some(udp) = packet.layer_viewer(Udp) {
-                metadata.src_port = Some(udp.src_port().raw());
-                metadata.dst_port = Some(udp.dst_port().raw());
-                metadata.udp_length = Some(udp.length().get());
-            }
-        }
+        extract_packet_metadata(&packet, &mut metadata, &mut stats);
 
         stats.update_with_metadata(&metadata);
         if let Some(interval_stats) = &mut interval_stats {
@@ -290,6 +267,55 @@ fn analyze(
     ))
 }
 
+fn extract_packet_metadata<T: AsRef<[u8]>>(
+    packet: &maja::packet::Packet<T>,
+    metadata: &mut PacketMetadata,
+    stats: &mut Stats,
+) {
+    if let Some(eth) = packet.layer_viewer(Eth) {
+        metadata.eth_type = eth.eth_type().raw();
+    } else if let Some(sll) = packet.layer_viewer(Sll) {
+        metadata.eth_type = sll.protocol_type().raw();
+    }
+
+    if let Some(ipv4) = packet.layer_viewer(Ipv4) {
+        stats.total_l3_bytes += u64::from(ipv4.total_length().get());
+
+        metadata.src_ip = Some(IpAddr::V4(ipv4.src().get()));
+        metadata.dst_ip = Some(IpAddr::V4(ipv4.dst().get()));
+        metadata.ip_proto = Some(ipv4.protocol().raw());
+        metadata.tos = Some(ipv4.tos().raw());
+        metadata.ttl = Some(ipv4.ttl().raw());
+        metadata.total_length = Some(ipv4.total_length().get());
+    } else if let Some(ipv6) = packet.layer_viewer(Ipv6) {
+        let payload_length = ipv6.payload_length().get();
+        stats.total_l3_bytes += u64::from(payload_length) + 40;
+
+        metadata.src_ip = Some(IpAddr::V6(ipv6.src().get()));
+        metadata.dst_ip = Some(IpAddr::V6(ipv6.dst().get()));
+        metadata.ip_proto = Some(ipv6.next_header().raw());
+        metadata.tos = Some(ipv6.traffic_class().get());
+        metadata.ttl = Some(ipv6.hop_limit().get());
+        metadata.ipv6_payload_length = Some(payload_length);
+    }
+
+    if metadata.src_ip.is_some() {
+        if let Some(tcp) = packet.layer_viewer(Tcp) {
+            metadata.ip_proto = Some(u8::from(IpProtocol::Tcp));
+            metadata.src_port = Some(tcp.src_port().raw());
+            metadata.dst_port = Some(tcp.dst_port().raw());
+            metadata.tcp_flags = Some(tcp.flags().raw());
+            metadata.tcp_window = Some(tcp.window_size().get());
+            metadata.tcp_data_offset = Some(tcp.data_offset().get());
+        } else if let Some(udp) = packet.layer_viewer(Udp) {
+            metadata.ip_proto = Some(u8::from(IpProtocol::Udp));
+            metadata.src_port = Some(udp.src_port().raw());
+            metadata.dst_port = Some(udp.dst_port().raw());
+            metadata.udp_length = Some(udp.length().get());
+        }
+    }
+}
+
 fn dump_path(file_path: &Path, output: Option<&Path>, format: DumpFormat) -> PathBuf {
     output
         .map(|directory| directory.join(file_path.file_name().expect("Invalid input file name")))
@@ -333,6 +359,40 @@ fn write_report_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv6Addr;
+
+    #[test]
+    fn extracts_ipv6_udp_metadata() {
+        let src = Ipv6Addr::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 1);
+        let dst = Ipv6Addr::new(0x2001, 0xdb8, 2, 0, 0, 0, 0, 2);
+        let mut frame = vec![
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0x86, 0xdd, // Ethernet
+            0x60, 0, 0, 0, // Version, traffic class, and flow label
+            0, 8, // Payload length
+            17, 64, // UDP and hop limit
+        ];
+        frame.extend_from_slice(&src.octets());
+        frame.extend_from_slice(&dst.octets());
+        frame.extend_from_slice(&[0x04, 0xd2, 0x16, 0x2e, 0, 8, 0, 0]);
+
+        let mut packet = maja::packet::Packet::new(frame);
+        packet
+            .try_parse_with_link_type(LinkType::Ethernet, Default::default())
+            .unwrap();
+        let mut metadata = PacketMetadata::default();
+        let mut stats = Stats::default();
+        extract_packet_metadata(&packet, &mut metadata, &mut stats);
+
+        assert_eq!(metadata.src_ip, Some(IpAddr::V6(src)));
+        assert_eq!(metadata.dst_ip, Some(IpAddr::V6(dst)));
+        assert_eq!(metadata.ip_proto, Some(u8::from(IpProtocol::Udp)));
+        assert_eq!(metadata.src_port, Some(1_234));
+        assert_eq!(metadata.dst_port, Some(5_678));
+        assert_eq!(metadata.tos, Some(0));
+        assert_eq!(metadata.ttl, Some(64));
+        assert_eq!(metadata.ipv6_payload_length, Some(8));
+        assert_eq!(stats.total_l3_bytes, 48);
+    }
 
     #[test]
     fn interval_parser_accepts_time_suffixes() {

@@ -69,7 +69,7 @@ The interval defaults to one second and accepts time suffixes such as `ns`,
 `ms`, `s`, `m`, and `h`. Intervals are aligned to Unix epoch boundaries and
 written chronologically, including for captures with unordered packet
 timestamps. Each row reports packet and L2 byte totals, pps, Bps, unique source
-and destination IPv4 values, and unique symmetric flows. TCP and UDP flows use
+and destination IP values, and unique symmetric flows. TCP and UDP flows use
 5-tuples; other IP protocols use 3-tuples of addresses and protocol. Empty
 intervals are omitted. `--output` controls the artifact directory.
 
@@ -101,17 +101,16 @@ Packet Statistics:
 
 Aggregated Statistics:
   Length:           349.65 (± 463.88) [60, 1518] Bytes
-  Unique SRC IP:    17
-  Unique DST IP:    8
+  Unique SRC IP:    16
+  Unique DST IP:    7
   TCP Count:        185
   UDP Count:        15
   Unique SRC Ports: 7
   Unique DST Ports: 7
   Unique flows:     15
 
-Top10 Statistics:
+  Top10 Statistics:
   Top 10 SRC IPs:
-    0.0.0.0          165.00 pkts,  20.61 kB
     131.151.32.129   138.00 pkts,  88.36 kB
     131.151.32.21     72.00 pkts,  19.91 kB
     131.151.6.171      5.00 pkts,   7.58 kB
@@ -122,7 +121,6 @@ Top10 Statistics:
     131.151.32.254     1.00 pkts,   70.00 B
     131.151.115.254    1.00 pkts,   70.00 B
   Top 10 DST IPs:
-    0.0.0.0          165.00 pkts,  20.61 kB
     131.151.32.21    133.00 pkts,  80.79 kB
     131.151.32.129    77.00 pkts,  27.48 kB
     255.255.255.255    9.00 pkts,  630.00 B
@@ -153,14 +151,14 @@ Export Statistics:
   Elapsed Time:       0.006240 s
 ======================================================================
 $ head vlan.csv
-timestamp,length,eth_type,src_ip4,dst_ip4,ip_proto,tos,ttl,total_length,src_port,dst_port,tcp_flags,tcp_window,tcp_data_offset,udp_length
-941826040056226000,1518,33024,2207719553,2207719445,6,0,64,1500,1162,6000,24,28920,8,0
-941826040056331000,650,33024,2207719553,2207719445,6,0,64,632,1162,6000,24,28920,8,0
-941826040059915000,64,33024,0,0,0,0,0,0,0,0,0,0,0,0
-941826040063897000,1518,33024,2207719553,2207719445,6,0,64,1500,1162,6000,24,28920,8,0
-941826040063982000,350,33024,2207719553,2207719445,6,0,64,332,1162,6000,24,28920,8,0
-941826040064555000,70,33024,2207719445,2207719553,6,0,64,52,6000,1162,16,31856,8,0
-941826040065843000,1518,33024,2207719445,2207719553,6,0,64,1500,6000,1162,24,31576,8,0
-941826040065888000,638,33024,2207719445,2207719553,6,0,64,620,6000,1162,24,31576,8,0
-941826040066028000,70,33024,2207719553,2207719445,6,0,64,52,1162,6000,16,27472,8,0
+timestamp,length,eth_type,src_ip,dst_ip,ip_proto,tos,ttl,total_length,src_port,dst_port,tcp_flags,tcp_window,tcp_data_offset,udp_length,ipv6_payload_length
+941826040056226000,1518,33024,131.151.32.129,131.151.32.21,6,0,64,1500,1162,6000,24,28920,8,0,0
+941826040056331000,650,33024,131.151.32.129,131.151.32.21,6,0,64,632,1162,6000,24,28920,8,0,0
+941826040059915000,64,33024,,,0,0,0,0,0,0,0,0,0,0,0
+941826040063897000,1518,33024,131.151.32.129,131.151.32.21,6,0,64,1500,1162,6000,24,28920,8,0,0
+941826040063982000,350,33024,131.151.32.129,131.151.32.21,6,0,64,332,1162,6000,24,28920,8,0,0
+941826040064555000,70,33024,131.151.32.21,131.151.32.129,6,0,64,52,6000,1162,16,31856,8,0,0
+941826040065843000,1518,33024,131.151.32.21,131.151.32.129,6,0,64,1500,6000,1162,24,31576,8,0,0
+941826040065888000,638,33024,131.151.32.21,131.151.32.129,6,0,64,620,6000,1162,24,31576,8,0,0
+941826040066028000,70,33024,131.151.32.129,131.151.32.21,6,0,64,52,1162,6000,16,27472,8,0,0
 ```
