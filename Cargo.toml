@@ -38,6 +38,7 @@ members = [
     "examples/pcap-read",
     "examples/ping",
     "tools/maja-capinfo",
+    "tools/maja-cicflowmeter",
     "tools/maja-mergecap",
     "tools/maja-splitcap",
 ]

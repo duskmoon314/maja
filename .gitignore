@@ -7,3 +7,5 @@
 *.pcap
 *.cap
 *.orig
+*.csv
+*.parquet

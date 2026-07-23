@@ -141,6 +141,7 @@ See the `examples/` directory for more usage examples.
 Command-line tools built upon `maja` live under `tools/`:
 
 - `maja-capinfo`: print capture file information.
+- `maja-cicflowmeter`: extract CICFlowMeter-compatible flow features.
 - `maja-mergecap`: merge capture files.
 - `maja-splitcap`: split captures by IP flow.
 

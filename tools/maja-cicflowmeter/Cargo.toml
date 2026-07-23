@@ -1,0 +1,18 @@
+[package]
+name = "maja-cicflowmeter"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Extract CICFlowMeter-compatible flow features from packet captures."
+readme = "README.md"
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+maja = { workspace = true }
+temporal_rs = { workspace = true }
