@@ -57,6 +57,12 @@ assert_eq!(ipv4.src(), std::net::Ipv4Addr::new(127, 0, 0, 1));
 # }
 ```
 
+`try_parse*` retains every layer recorded before an error, so callers can
+inspect `packet.layers()` or typed viewers without reparsing the packet. To
+parse an Ethernet/IPv4 packet only through TCP or UDP, use
+`ParseOptions { max_depth: Some(3), ..Default::default() }`; any remaining
+application payload is recorded as `Raw`.
+
 ### Capture File I/O
 
 ```rust

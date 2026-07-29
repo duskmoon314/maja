@@ -124,6 +124,10 @@ where
     }
 
     /// Parses the packet and returns a structured error on malformed input.
+    ///
+    /// The packet's layer table is updated on both success and failure. If
+    /// parsing fails, layers recorded before the failure remain available
+    /// through [`layers`](Packet::layers) and the layer lookup methods.
     pub fn try_parse<P: ProtocolExt>(&mut self, options: ParseOptions) -> Result<(), ParseError> {
         let mut context = ParseContext::new(self.bytes.as_ref(), options, self.layers.clone());
 
@@ -138,6 +142,10 @@ where
     }
 
     /// Parses the packet using the root protocol implied by a capture link type.
+    ///
+    /// The packet's layer table is updated on both success and failure. If
+    /// parsing fails, layers recorded before the failure remain available
+    /// through [`layers`](Packet::layers) and the layer lookup methods.
     pub fn try_parse_with_link_type(
         &mut self,
         link_type: LinkType,
@@ -320,6 +328,10 @@ pub struct ParseOptions {
     /// If `Some(n)`, structured parsing stops after `n` decoded protocol
     /// layers. When bytes remain at a stopped child boundary, a terminal
     /// `Raw` layer records the unparsed remainder.
+    ///
+    /// The root protocol counts as the first layer. For example,
+    /// `Some(3)` parses an Ethernet/IPv4 packet through its transport layer and
+    /// records the application payload as `Raw`.
     pub max_depth: Option<usize>,
 }
 
@@ -725,6 +737,10 @@ mod tests {
             }
             err => panic!("unexpected error: {err}"),
         }
+
+        assert_eq!(packet.layers().len(), 1);
+        assert!(packet.layer(Eth).is_some());
+        assert!(packet.layer(layer::ip::v4::Ipv4).is_none());
     }
 
     #[test]
@@ -776,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn max_depth_limits_layer_parsing() {
+    fn max_depth_can_stop_after_transport_layer() {
         let data = [
             01, 02, 03, 04, 05, 06, // Destination MAC
             11, 12, 13, 14, 15, 16, // Source MAC
@@ -800,18 +816,18 @@ mod tests {
         let mut packet = Packet::new(&data);
         packet
             .try_parse::<Eth>(ParseOptions {
-                max_depth: Some(2),
+                max_depth: Some(3),
                 ..Default::default()
             })
             .expect("parse should stop cleanly at max_depth");
 
-        assert_eq!(packet.layers.len(), 3);
+        assert_eq!(packet.layers.len(), 4);
         assert!(packet.layer(Eth).is_some());
         assert!(packet.layer(layer::ip::v4::Ipv4).is_some());
-        assert!(packet.layer(layer::udp::Udp).is_none());
+        assert!(packet.layer(layer::udp::Udp).is_some());
         assert_eq!(
             packet.layer_viewer(Raw).expect("raw remainder").bytes(),
-            &[0x04, 0xd2, 0x04, 0xd3, 0x00, 0x0c, 0x00, 0x00, 1, 2, 3, 4]
+            &[1, 2, 3, 4]
         );
     }
 
