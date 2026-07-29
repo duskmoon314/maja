@@ -128,6 +128,9 @@ where
     /// The packet's layer table is updated on both success and failure. If
     /// parsing fails, layers recorded before the failure remain available
     /// through [`layers`](Packet::layers) and the layer lookup methods.
+    /// Child protocol errors are recovered as `Raw` by default; set
+    /// [`fallback_to_raw_on_child_error`](ParseOptions::fallback_to_raw_on_child_error)
+    /// to `false` to return them.
     pub fn try_parse<P: ProtocolExt>(&mut self, options: ParseOptions) -> Result<(), ParseError> {
         let mut context = ParseContext::new(self.bytes.as_ref(), options, self.layers.clone());
 
@@ -146,6 +149,9 @@ where
     /// The packet's layer table is updated on both success and failure. If
     /// parsing fails, layers recorded before the failure remain available
     /// through [`layers`](Packet::layers) and the layer lookup methods.
+    /// Child protocol errors are recovered as `Raw` by default; set
+    /// [`fallback_to_raw_on_child_error`](ParseOptions::fallback_to_raw_on_child_error)
+    /// to `false` to return them.
     pub fn try_parse_with_link_type(
         &mut self,
         link_type: LinkType,
@@ -311,11 +317,15 @@ where
 }
 
 /// Options controlling packet parsing behavior.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct ParseOptions {
     /// Whether to panic on parsing errors.
     ///
-    /// If `false` (default), only a `log::error!` will be emitted on parsing errors
+    /// This option applies to [`parse`](Packet::parse) and
+    /// [`parse_with_link_type`](Packet::parse_with_link_type). If `false`
+    /// (default), propagated errors are logged instead. Child errors recovered
+    /// through [`fallback_to_raw_on_child_error`](Self::fallback_to_raw_on_child_error)
+    /// do not panic.
     pub panic: bool,
 
     /// Custom protocol registry for parsing non-standard protocols.
@@ -333,6 +343,26 @@ pub struct ParseOptions {
     /// `Some(3)` parses an Ethernet/IPv4 packet through its transport layer and
     /// records the application payload as `Raw`.
     pub max_depth: Option<usize>,
+
+    /// Whether a failed child protocol should be retained as raw bytes.
+    ///
+    /// If `true` (default), an error below the root protocol is logged at debug
+    /// level, layers added by the failed child attempt are removed, and its
+    /// non-empty byte region is recorded as `Raw`. If `false`, the error is
+    /// returned to the caller and layers recorded before the failure remain
+    /// available.
+    pub fallback_to_raw_on_child_error: bool,
+}
+
+impl Default for ParseOptions {
+    fn default() -> Self {
+        Self {
+            panic: false,
+            registry: CustomProtocolRegistry::default(),
+            max_depth: None,
+            fallback_to_raw_on_child_error: true,
+        }
+    }
 }
 
 /// Mutable parser state shared by protocol parser implementations.
@@ -368,17 +398,12 @@ impl<'a> ParseContext<'a> {
         }
     }
 
-    /// Parse a child protocol or record the child bytes as raw when depth stops.
+    /// Parse a child protocol, applying the configured depth and error fallback.
     pub fn parse_child<P: Protocol + ProtocolExt>(
         &mut self,
         offset: usize,
     ) -> Result<(), ParseError> {
-        if self.can_push_layer() {
-            P::parse(self, offset)
-        } else {
-            self.parse_raw(offset);
-            Ok(())
-        }
+        self.parse_child_with(P::parse, offset)
     }
 
     pub(crate) fn parse_child_with(
@@ -386,11 +411,22 @@ impl<'a> ParseContext<'a> {
         parse_fn: ParseFn,
         offset: usize,
     ) -> Result<(), ParseError> {
-        if self.can_push_layer() {
-            parse_fn(self, offset)
-        } else {
+        if !self.can_push_layer() {
             self.parse_raw(offset);
-            Ok(())
+            return Ok(());
+        }
+
+        let layer_checkpoint = self.layers.len();
+        let fallback_to_raw = self.options.fallback_to_raw_on_child_error;
+        match parse_fn(self, offset) {
+            Ok(()) => Ok(()),
+            Err(err) if fallback_to_raw => {
+                self.layers.truncate(layer_checkpoint);
+                self.parse_raw(offset);
+                log::debug!("child parsing failed at offset {offset}; falling back to Raw: {err}");
+                Ok(())
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -504,6 +540,60 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Debug, Clone, Copy)]
+    struct FailingChild;
+
+    impl Protocol for FailingChild {}
+
+    impl ProtocolExt for FailingChild {
+        type Viewer<'a> = &'a [u8];
+        type ViewerMut<'a> = &'a mut [u8];
+
+        fn parse(ctx: &mut ParseContext, offset: usize) -> Result<(), ParseError> {
+            ctx.require(&FailingChild, offset, 1)?;
+            ctx.push_layer(&FailingChild, offset, 1);
+            Err(ParseError::Malformed {
+                protocol: &FailingChild,
+                field: "test field",
+                reason: "intentional test failure",
+            })
+        }
+
+        fn view<'a>(bytes: &'a [u8]) -> Self::Viewer<'a> {
+            bytes
+        }
+
+        fn view_mut<'a>(bytes: &'a mut [u8]) -> Self::ViewerMut<'a> {
+            bytes
+        }
+    }
+
+    fn ethernet_ipv4_udp(dst_port: u16, payload: &[u8]) -> Vec<u8> {
+        let udp_len = u16::try_from(8 + payload.len()).expect("test UDP length");
+        let ipv4_len = 20 + udp_len;
+        let mut data = Vec::new();
+        data.extend_from_slice(&[
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // Destination MAC
+            0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, // Source MAC
+            0x08, 0x00, // EtherType: IPv4
+            0x45, 0x00, // Version/IHL, DSCP/ECN
+        ]);
+        data.extend_from_slice(&ipv4_len.to_be_bytes());
+        data.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x00, // Identification, flags/fragment offset
+            0x40, 0x11, // TTL, protocol: UDP
+            0x00, 0x00, // Header checksum
+            10, 0, 1, 1, // Source IP
+            10, 0, 1, 2, // Destination IP
+            0x04, 0xd2, // Source port: 1234
+        ]);
+        data.extend_from_slice(&dst_port.to_be_bytes());
+        data.extend_from_slice(&udp_len.to_be_bytes());
+        data.extend_from_slice(&[0x00, 0x00]); // UDP checksum
+        data.extend_from_slice(payload);
+        data
+    }
 
     #[test]
     fn parse_eth_packet() {
@@ -719,7 +809,10 @@ mod tests {
 
         let mut packet = Packet::new(&data);
         let err = packet
-            .try_parse::<Eth>(Default::default())
+            .try_parse::<Eth>(ParseOptions {
+                fallback_to_raw_on_child_error: false,
+                ..Default::default()
+            })
             .expect_err("invalid IHL should be malformed");
 
         match err {
@@ -771,7 +864,10 @@ mod tests {
 
         let mut packet = Packet::new(&data);
         let err = packet
-            .try_parse::<Eth>(Default::default())
+            .try_parse::<Eth>(ParseOptions {
+                fallback_to_raw_on_child_error: false,
+                ..Default::default()
+            })
             .expect_err("invalid TCP data offset should be malformed");
 
         match err {
@@ -828,6 +924,109 @@ mod tests {
         assert_eq!(
             packet.layer_viewer(Raw).expect("raw remainder").bytes(),
             &[1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn malformed_dns_falls_back_to_raw_by_default() {
+        let data = ethernet_ipv4_udp(layer::udp::Udp::DNS_PORT, &[1, 2, 3, 4]);
+        let mut packet = Packet::new(&data);
+
+        packet
+            .try_parse::<Eth>(Default::default())
+            .expect("malformed child should fall back to raw");
+
+        assert!(ParseOptions::default().fallback_to_raw_on_child_error);
+        assert!(packet.layer(Eth).is_some());
+        assert!(packet.layer(layer::ip::v4::Ipv4).is_some());
+        assert!(packet.layer(layer::udp::Udp).is_some());
+        assert!(packet.layer(layer::dns::Dns).is_none());
+        assert_eq!(
+            packet.layer_viewer(Raw).expect("raw payload").bytes(),
+            &[1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn strict_child_errors_are_returned_with_parent_layers_retained() {
+        let data = ethernet_ipv4_udp(layer::udp::Udp::DNS_PORT, &[1, 2, 3, 4]);
+        let mut packet = Packet::new(&data);
+
+        let err = packet
+            .try_parse::<Eth>(ParseOptions {
+                fallback_to_raw_on_child_error: false,
+                ..Default::default()
+            })
+            .expect_err("strict child parsing should return the DNS error");
+
+        assert!(matches!(
+            err,
+            ParseError::Truncated { protocol, .. }
+                if protocol.id() == layer::dns::Dns.id()
+        ));
+        assert_eq!(packet.layers().len(), 3);
+        assert!(packet.layer(Eth).is_some());
+        assert!(packet.layer(layer::ip::v4::Ipv4).is_some());
+        assert!(packet.layer(layer::udp::Udp).is_some());
+        assert!(packet.layer(Raw).is_none());
+    }
+
+    #[test]
+    fn empty_dns_child_retains_transport_without_zero_length_raw() {
+        let data = ethernet_ipv4_udp(layer::udp::Udp::DNS_PORT, &[]);
+        let mut packet = Packet::new(&data);
+
+        packet
+            .try_parse::<Eth>(Default::default())
+            .expect("empty DNS child should be recovered");
+
+        assert_eq!(packet.layers().len(), 3);
+        assert!(packet.layer(layer::udp::Udp).is_some());
+        assert!(packet.layer(layer::dns::Dns).is_none());
+        assert!(packet.layer(Raw).is_none());
+    }
+
+    #[test]
+    fn empty_gre_child_retains_network_without_zero_length_raw() {
+        let data = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // Destination MAC
+            0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, // Source MAC
+            0x08, 0x00, // EtherType: IPv4
+            0x45, 0x00, 0x00, 0x14, // Version/IHL, DSCP/ECN, total length
+            0x00, 0x00, 0x00, 0x00, // Identification, flags/fragment offset
+            0x40, 0x2f, 0x00, 0x00, // TTL, protocol: GRE, checksum
+            10, 0, 1, 1, // Source IP
+            10, 0, 1, 2, // Destination IP
+        ];
+        let mut packet = Packet::new(&data);
+
+        packet
+            .try_parse::<Eth>(Default::default())
+            .expect("empty GRE child should be recovered");
+
+        assert_eq!(packet.layers().len(), 2);
+        assert!(packet.layer(layer::ip::v4::Ipv4).is_some());
+        assert!(packet.layer(layer::gre::Gre).is_none());
+        assert!(packet.layer(Raw).is_none());
+    }
+
+    #[test]
+    fn failed_custom_child_rolls_back_layers_before_raw_fallback() {
+        let data = ethernet_ipv4_udp(9999, &[0xaa, 0xbb]);
+        let mut options = ParseOptions::default();
+        options
+            .registry
+            .register::<_, FailingChild>(layer::udp::Udp, 9999);
+        let mut packet = Packet::new(&data);
+
+        packet
+            .try_parse::<Eth>(options)
+            .expect("failed custom child should fall back to raw");
+
+        assert!(packet.layer(FailingChild).is_none());
+        assert_eq!(
+            packet.layer_viewer(Raw).expect("raw payload").bytes(),
+            &[0xaa, 0xbb]
         );
     }
 

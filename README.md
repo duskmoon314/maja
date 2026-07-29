@@ -47,7 +47,10 @@ let bytes: [u8; 34] = [
 ];
 
 let mut packet = Packet::new(bytes);
-let res = packet.try_parse_with_link_type(LinkType::Ethernet, Default::default());
+let res = packet.try_parse_with_link_type(LinkType::Ethernet, ParseOptions {
+    fallback_to_raw_on_child_error: false,
+    ..Default::default()
+});
 assert!(res.is_err()); // The packet is invalid due to truncated data
 
 // But we can still view the layers that were successfully parsed:
