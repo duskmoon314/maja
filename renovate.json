@@ -20,6 +20,16 @@
       "minimumReleaseAge": "3 days"
     },
     {
+      "description": "Exempt lock file maintenance from minimum release age (not supported for lockFileMaintenance)",
+      "matchManagers": [
+        "cargo"
+      ],
+      "matchUpdateTypes": [
+        "lockFileMaintenance"
+      ],
+      "minimumReleaseAge": null
+    },
+    {
       "description": "Group low-risk patch updates",
       "matchManagers": [
         "cargo"
