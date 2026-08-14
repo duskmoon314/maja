@@ -5,7 +5,10 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use log::debug;
 
 use crate::capture::{
-    CaptureError, CaptureReader, endian::Endian, interface::Interface, link_type::LinkType,
+    CaptureError, CaptureReader,
+    endian::Endian,
+    interface::Interface,
+    link_type::LinkType,
     packet::{LocatedPacketRecord, PacketRecord},
 };
 
