@@ -1,0 +1,18 @@
+[package]
+name = "maja-reordercap"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+repository.workspace = true
+license.workspace = true
+description = "Reorder packets in a capture file by timestamp."
+readme = "README.md"
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+maja = { workspace = true }
+memmap2 = { workspace = true }

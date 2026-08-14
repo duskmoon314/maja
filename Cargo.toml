@@ -41,6 +41,7 @@ members = [
     "tools/maja-capinfo",
     "tools/maja-cicflowmeter",
     "tools/maja-mergecap",
+    "tools/maja-reordercap",
     "tools/maja-splitcap",
 ]
 
