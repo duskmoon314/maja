@@ -619,7 +619,7 @@ mod tests {
                 orig_len: 4,
             };
 
-            writer.write_packet_raw(header, &[1, 2, 3, 4]).unwrap();
+            writer.write_packet_raw(header, [1, 2, 3, 4]).unwrap();
         }
 
         assert_eq!(

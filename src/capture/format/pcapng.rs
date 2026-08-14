@@ -1424,7 +1424,7 @@ mod tests {
     #[test]
     fn epb_calc_timestamp() {
         // 2001-02-03 04:05:06.789012
-        let raw = 981144306789012 as u64;
+        let raw = 981144306789012_u64;
         let tsresol = 6;
         let tsoffset = 0;
 

@@ -84,13 +84,13 @@ mod tests {
         assert_eq!(flags, TcpFlags::SYN | TcpFlags::ACK);
         assert_eq!(flags, TcpFlags::from_bits(0b0001_0010).unwrap());
         assert_eq!(flags.bits(), 0b0001_0010);
-        assert_eq!(flags.contains(TcpFlags::SYN), true);
-        assert_eq!(flags.contains(TcpFlags::ACK), true);
-        assert_eq!(flags.contains(TcpFlags::FIN), false);
-        assert_eq!(flags.contains(TcpFlags::RST), false);
-        assert_eq!(flags.contains(TcpFlags::URG), false);
-        assert_eq!(flags.contains(TcpFlags::ECE), false);
-        assert_eq!(flags.contains(TcpFlags::CWR), false);
-        assert_eq!(flags.contains(TcpFlags::PSH), false);
+        assert!(flags.contains(TcpFlags::SYN));
+        assert!(flags.contains(TcpFlags::ACK));
+        assert!(!flags.contains(TcpFlags::FIN));
+        assert!(!flags.contains(TcpFlags::RST));
+        assert!(!flags.contains(TcpFlags::URG));
+        assert!(!flags.contains(TcpFlags::ECE));
+        assert!(!flags.contains(TcpFlags::CWR));
+        assert!(!flags.contains(TcpFlags::PSH));
     }
 }
