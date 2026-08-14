@@ -1,0 +1,13 @@
+[package]
+name = "pcap-read-mmap"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+clap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+anyhow = { workspace = true }
+memmap2 = { workspace = true }
+maja = { workspace = true }

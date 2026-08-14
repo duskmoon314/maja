@@ -1857,6 +1857,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pcap-read-mmap"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "env_logger",
+ "log",
+ "maja",
+ "memmap2",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
