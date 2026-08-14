@@ -77,6 +77,23 @@ impl Ord for PacketRecord<'_> {
     }
 }
 
+/// A packet record together with the location of its source bytes.
+///
+/// Slice-based readers return this to enable index-then-copy workflows: the
+/// raw bytes can be copied verbatim into a reordered output.
+#[derive(Debug)]
+pub struct LocatedPacketRecord<'a> {
+    /// Byte offset of the record in the input slice
+    pub offset: usize,
+
+    /// Complete raw bytes of the record (including any record or block
+    /// headers)
+    pub raw: &'a [u8],
+
+    /// Parsed packet record borrowing from `raw`
+    pub packet: PacketRecord<'a>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

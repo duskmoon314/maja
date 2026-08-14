@@ -7,7 +7,7 @@ use std::{
     ops::Deref,
 };
 
-use log::{debug, error, trace};
+use log::{debug, trace};
 use num_enum::{FromPrimitive, IntoPrimitive};
 
 use crate::{
@@ -16,7 +16,7 @@ use crate::{
         endian::Endian,
         interface::{self, Interface},
         link_type::LinkType,
-        packet::PacketRecord,
+        packet::{LocatedPacketRecord, PacketRecord},
     },
     packet::layer::eth::EthAddr,
 };
@@ -195,6 +195,58 @@ pub mod option_type {
     pub const ISB_USR_DELIVER: u16 = 8;
 }
 
+/// Read one option at `offset` from `buffer`, advancing `offset` past it.
+///
+/// Returns the option type, value length, and value bytes. Options are padded
+/// to 32 bits; the padding is consumed but not returned.
+fn read_option<'a>(
+    buffer: &'a [u8],
+    endian: Endian,
+    offset: &mut usize,
+) -> Result<(u16, u16, &'a [u8]), CaptureError> {
+    let option_type = endian.read_u16(&buffer[*offset..*offset + 2]);
+
+    debug!("Option type: {}", option_type);
+
+    let option_length = endian.read_u16(&buffer[*offset + 2..*offset + 4]);
+
+    debug!("Option length: {}", option_length);
+
+    if option_type == option_type::END_OF_OPT {
+        *offset += 4;
+        return Ok((option_type, option_length, &[]));
+    }
+
+    let option_value = &buffer[*offset + 4..*offset + 4 + option_length as usize];
+
+    // The offset is padded to 32 bits, so we need to round up to the next multiple of 4
+    *offset += 4 + option_length.next_multiple_of(4) as usize;
+
+    Ok((option_type, option_length, option_value))
+}
+
+/// Check that the trailing block total length matches the leading one.
+///
+/// A mismatch means the block is corrupt, so a
+/// [`PcapngBlockTotalLengthMismatch`](CaptureError::PcapngBlockTotalLengthMismatch)
+/// error is returned. Callers may still resume parsing with the next block if they
+/// choose to: block boundaries are derived from the leading length alone,
+/// which both readers consume before this check runs.
+fn check_block_total_length(
+    block: &[u8],
+    endian: Endian,
+    what: &'static str,
+) -> Result<(), CaptureError> {
+    let leading = endian.read_u32(&block[4..8]);
+    let trailing = endian.read_u32(&block[block.len() - 4..]);
+    if leading != trailing {
+        return Err(CaptureError::PcapngBlockTotalLengthMismatch(
+            what, leading, trailing,
+        ));
+    }
+    Ok(())
+}
+
 /// # Section Header Block (SHB)
 #[derive(Debug, Default, Clone)]
 pub struct SectionHeader {
@@ -218,6 +270,64 @@ pub struct SectionHeader {
 
     /// Optional application name from the `shb_userappl` option.
     pub user_appl: Option<String>,
+}
+
+impl SectionHeader {
+    /// Parse a Section Header Block from its complete bytes, from the block
+    /// type field through the trailing block total length.
+    pub fn parse(block: &[u8]) -> Result<Self, CaptureError> {
+        if block.len() < 28 {
+            return Err(CaptureError::TruncatedCapture(
+                "pcapng section header block",
+            ));
+        }
+
+        let mut section_header = SectionHeader {
+            endian: if block[8..12] == [0x1A, 0x2B, 0x3C, 0x4D] {
+                Endian::Big
+            } else {
+                Endian::Little
+            },
+            ..Default::default()
+        };
+        let endian = section_header.endian;
+
+        section_header.major_version = endian.read_u16(&block[12..14]);
+        section_header.minor_version = endian.read_u16(&block[14..16]);
+        section_header.section_length = endian.read_i64(&block[16..24]);
+
+        let mut position = 24;
+        while position < block.len() - 4 {
+            let (option_type, _option_length, option_value) =
+                read_option(block, endian, &mut position)?;
+
+            match option_type {
+                option_type::END_OF_OPT => {
+                    break;
+                }
+
+                option_type::SHB_HARDWARE => {
+                    section_header.hardware = Some(String::from_utf8(option_value.to_vec())?)
+                }
+
+                option_type::SHB_OS => {
+                    section_header.os = Some(String::from_utf8(option_value.to_vec())?)
+                }
+
+                option_type::SHB_USER_APPL => {
+                    section_header.user_appl = Some(String::from_utf8(option_value.to_vec())?)
+                }
+
+                _ => {
+                    // Skip unknown / unsupported option types
+                }
+            }
+        }
+
+        check_block_total_length(block, endian, "Section header")?;
+
+        Ok(section_header)
+    }
 }
 
 /// # Interface Description Block (IDB)
@@ -291,7 +401,126 @@ impl InterfaceDescription {
         }
     }
 
-    fn to_interface(&self) -> Interface {
+    /// Parse an Interface Description Block from its complete bytes, from the
+    /// block type field through the trailing block total length, using the
+    /// current section's byte order.
+    pub fn parse(block: &[u8], endian: Endian) -> Result<Self, CaptureError> {
+        if block.len() < 20 {
+            return Err(CaptureError::TruncatedCapture(
+                "pcapng interface description block",
+            ));
+        }
+
+        let mut interface = InterfaceDescription {
+            link_type: LinkType::from(endian.read_u16(&block[8..10])),
+            snap_len: endian.read_u32(&block[12..16]),
+            ..Default::default()
+        };
+
+        let mut position = 16;
+        while position < block.len() - 4 {
+            let (option_type, _option_length, option_value) =
+                read_option(block, endian, &mut position)?;
+
+            match option_type {
+                option_type::END_OF_OPT => {
+                    break;
+                }
+
+                option_type::IF_NAME => {
+                    interface.name = Some(String::from_utf8(option_value.to_vec())?)
+                }
+
+                option_type::IF_DESCRIPTION => {
+                    interface.description = Some(String::from_utf8(option_value.to_vec())?)
+                }
+
+                option_type::IF_IPV4_ADDR => interface.ipv4_addr.push((
+                    Ipv4Addr::new(
+                        option_value[0],
+                        option_value[1],
+                        option_value[2],
+                        option_value[3],
+                    ),
+                    Ipv4Addr::new(
+                        option_value[4],
+                        option_value[5],
+                        option_value[6],
+                        option_value[7],
+                    ),
+                )),
+
+                option_type::IF_IPV6_ADDR => {
+                    let addr = Ipv6Addr::from_octets(option_value[0..16].try_into()?);
+                    let prefix_len = option_value[16];
+                    interface.ipv6_addr.push((addr, prefix_len));
+                }
+
+                option_type::IF_MAC_ADDR => {
+                    interface.mac_addr = Some(EthAddr::from_slice(option_value));
+                }
+
+                option_type::IF_EUI_ADDR => {
+                    interface.eui_addr = Some(option_value.try_into()?);
+                }
+
+                option_type::IF_SPEED => {
+                    interface.speed = Some(endian.read_u64(option_value));
+                }
+
+                option_type::IF_TSRESOL => {
+                    interface.tsresol = Some(option_value[0]);
+                }
+
+                option_type::IF_TZONE => {
+                    interface.tzone = Some(endian.read_i32(option_value));
+                }
+
+                option_type::IF_FILTER => {
+                    interface.filter = option_value.to_vec();
+                }
+
+                option_type::IF_OS => {
+                    interface.os = Some(String::from_utf8(option_value.to_vec())?)
+                }
+
+                option_type::IF_FCSLEN => {
+                    interface.fcs_len = Some(option_value[0]);
+                }
+
+                option_type::IF_TSOFFSET => {
+                    interface.tsoffset = Some(endian.read_i64(option_value));
+                }
+
+                option_type::IF_HARDWARE => {
+                    interface.hardware = Some(String::from_utf8(option_value.to_vec())?)
+                }
+
+                option_type::IF_TXSPEED => {
+                    interface.txspeed = Some(endian.read_u64(option_value));
+                }
+
+                option_type::IF_RXSPEED => {
+                    interface.rxspeed = Some(endian.read_u64(option_value));
+                }
+
+                option_type::IF_IANA_TZNAME => {
+                    interface.iana_tzname = Some(String::from_utf8(option_value.to_vec())?)
+                }
+
+                _ => {
+                    // Skip unknown / unsupported option types
+                }
+            }
+        }
+
+        check_block_total_length(block, endian, "Interface description")?;
+
+        Ok(interface)
+    }
+
+    /// Build the generic interface metadata for this description.
+    pub fn to_interface(&self) -> Interface {
         Interface {
             link_type: self.link_type,
             snap_len: self.snap_len,
@@ -311,6 +540,28 @@ pub struct SimplePacketHeader {
 }
 
 impl SimplePacketHeader {
+    /// Parse a Simple Packet Block from its complete bytes, from the block
+    /// type field through the trailing block total length, using the current
+    /// section's byte order.
+    ///
+    /// Returns the header and the packet data bytes. The data slice may
+    /// include 32-bit padding bytes, matching the streaming reader's
+    /// behavior.
+    pub fn parse(block: &[u8], endian: Endian) -> Result<(Self, &[u8]), CaptureError> {
+        if block.len() < 16 {
+            return Err(CaptureError::TruncatedCapture("pcapng simple packet block"));
+        }
+
+        check_block_total_length(block, endian, "Simple packet")?;
+
+        let header = Self {
+            original_len: endian.read_u32(&block[8..12]),
+        };
+        let data = &block[12..block.len() - 4];
+
+        Ok((header, data))
+    }
+
     /// Convert this header and packet bytes into a common packet record.
     ///
     /// Simple Packet Blocks do not carry timestamps and are defined relative to
@@ -464,6 +715,90 @@ impl Deref for EnhancedPacket<'_> {
 }
 
 impl EnhancedPacketHeaderOptions {
+    /// Parse an Enhanced Packet Block from its complete bytes, from the block
+    /// type field through the trailing block total length, using the current
+    /// section's byte order.
+    ///
+    /// Returns the parsed header fields and options, plus the packet data
+    /// bytes (32-bit padding excluded).
+    pub fn parse(block: &[u8], endian: Endian) -> Result<(Self, &[u8]), CaptureError> {
+        if block.len() < 32 {
+            return Err(CaptureError::TruncatedCapture(
+                "pcapng enhanced packet block",
+            ));
+        }
+
+        let mut enhanced_packet = Self {
+            interface_id: endian.read_u32(&block[8..12]),
+            timestamp_high: endian.read_u32(&block[12..16]),
+            timestamp_low: endian.read_u32(&block[16..20]),
+            captured_len: endian.read_u32(&block[20..24]),
+            original_len: endian.read_u32(&block[24..28]),
+            ..Default::default()
+        };
+
+        // The packet data is padded to 32 bits, so the options start after
+        // the padded data.
+        let padded_length = enhanced_packet.captured_len.next_multiple_of(4) as usize;
+        let options_start = 28 + padded_length;
+        if block.len() < options_start + 4 {
+            return Err(CaptureError::TruncatedCapture(
+                "pcapng enhanced packet block",
+            ));
+        }
+        let data = &block[28..28 + enhanced_packet.captured_len as usize];
+
+        let mut position = options_start;
+        while position < block.len() - 4 {
+            let (option_type, _option_length, option_value) =
+                read_option(block, endian, &mut position)?;
+
+            match option_type {
+                option_type::END_OF_OPT => {
+                    break;
+                }
+
+                option_type::EPB_FLAGS => {
+                    enhanced_packet.flags = Some(endian.read_u32(option_value));
+                }
+
+                option_type::EPB_HASH => {
+                    enhanced_packet.hash.push(option_value.to_vec());
+                }
+
+                option_type::EPB_DROPCOUNT => {
+                    enhanced_packet.drop_count = Some(endian.read_u64(option_value));
+                }
+
+                option_type::EPB_PACKET_ID => {
+                    enhanced_packet.packet_id = Some(endian.read_u64(option_value));
+                }
+
+                option_type::EPB_QUEUE => {
+                    enhanced_packet.queue = Some(endian.read_u32(option_value));
+                }
+
+                option_type::EPB_VERDICT => {
+                    enhanced_packet.verdict.push(option_value.to_vec());
+                }
+
+                option_type::EPB_PROCESSID_THREADID => {
+                    let process_id = endian.read_u32(&option_value[0..4]);
+                    let thread_id = endian.read_u32(&option_value[4..8]);
+                    enhanced_packet.processid_threadid = Some((process_id, thread_id));
+                }
+
+                _ => {
+                    // Skip unknown / unsupported option types
+                }
+            }
+        }
+
+        check_block_total_length(block, endian, "Enhanced packet")?;
+
+        Ok((enhanced_packet, data))
+    }
+
     fn calc_timestamp(raw: u64, tsresol: u8, tsoffset: i64) -> i64 {
         let timestamp = match tsresol {
             power_of_10 @ 0..=127 => {
@@ -591,475 +926,124 @@ impl<R: Read> PcapngReader<R> {
 
     /// Read the next pcapng block.
     pub fn next_block(&mut self) -> Result<Option<PcapngBlock<'_>>, CaptureError> {
-        let block_type = match self.next_block_type()? {
+        let block_type = match self.read_next_block()? {
             Some(block_type) => block_type,
             None => return Ok(None),
         };
 
+        let block = self.buffer.as_slice();
+
         match block_type {
-            BlockType::SectionHeader => self
-                .read_section_header()
-                .map(PcapngBlock::SectionHeader)
-                .map(Some),
-
-            BlockType::InterfaceDescription => self
-                .read_interface_description()
-                .map(PcapngBlock::InterfaceDescription)
-                .map(Some),
-
-            BlockType::SimplePacket => self
-                .read_simple_packet()
-                .map(|spb| {
-                    PcapngBlock::SimplePacket(SimplePacket {
-                        header: spb,
-                        packet_data: Cow::Borrowed(&self.buffer),
-                    })
-                })
-                .map(Some),
-
-            BlockType::EnhancedPacket => self
-                .read_enhanced_packet()
-                .map(|epb| {
-                    PcapngBlock::EnhancedPacket(EnhancedPacket {
-                        header_options: epb,
-                        packet_data: Cow::Borrowed(&self.buffer),
-                    })
-                })
-                .map(Some),
-
-            _ => self.read_unsupported_block().map(Some),
-        }
-    }
-
-    fn next_block_type(&mut self) -> Result<Option<BlockType>, CaptureError> {
-        let mut block_type_bytes = [0u8; 4];
-
-        match self.reader.read_exact(&mut block_type_bytes) {
-            Ok(()) => {
-                // let block_type_be = u32::from_be_bytes(block_type_bytes);
-                // let block_type = BlockType::from(u32::from_be_bytes(block_type_bytes));
-
-                if block_type_bytes == [0x0A, 0x0D, 0x0D, 0x0A] {
-                    // A new section header
-                    Ok(Some(BlockType::SectionHeader))
-                } else {
-                    // Not a section header, we need to use the current section header to determine the endianness
-                    if let Some(section) = self.section() {
-                        Ok(Some(BlockType::from(
-                            section.endian.read_u32(&block_type_bytes),
-                        )))
-                    } else {
-                        // No section header + not a section header block type
-                        Err(CaptureError::InvalidMagicNumber(u32::from_be_bytes(
-                            block_type_bytes,
-                        )))
-                    }
-                }
+            BlockType::SectionHeader => {
+                let section_header = SectionHeader::parse(block)?;
+                self.section = Some(section_header.clone());
+                Ok(Some(PcapngBlock::SectionHeader(section_header)))
             }
 
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            BlockType::InterfaceDescription => {
+                let endian = self
+                    .section
+                    .as_ref()
+                    .expect("No section header found")
+                    .endian;
+                let interface = InterfaceDescription::parse(block, endian)?;
+                self.interfaces.push(interface.clone());
+                Ok(Some(PcapngBlock::InterfaceDescription(interface)))
+            }
 
-            Err(e) => Err(e.into()),
+            BlockType::SimplePacket => {
+                let endian = self
+                    .section
+                    .as_ref()
+                    .expect("No section header found")
+                    .endian;
+                let (header, data) = SimplePacketHeader::parse(block, endian)?;
+                Ok(Some(PcapngBlock::SimplePacket(SimplePacket {
+                    header,
+                    packet_data: Cow::Borrowed(data),
+                })))
+            }
+
+            BlockType::EnhancedPacket => {
+                let endian = self
+                    .section
+                    .as_ref()
+                    .expect("No section header found")
+                    .endian;
+                let (header_options, data) = EnhancedPacketHeaderOptions::parse(block, endian)?;
+                Ok(Some(PcapngBlock::EnhancedPacket(EnhancedPacket {
+                    header_options,
+                    packet_data: Cow::Borrowed(data),
+                })))
+            }
+
+            _ => Ok(Some(PcapngBlock::Raw {
+                block_type,
+                data: Cow::Borrowed(&block[8..]),
+            })),
         }
     }
 
-    fn read_option<'a>(
-        buffer: &'a [u8],
-        endian: Endian,
-        offset: &mut usize,
-    ) -> Result<(u16, u16, &'a [u8]), CaptureError> {
-        // debug!(
-        //     "Reading option at offset {} {:?}",
-        //     offset,
-        //     &buffer[*offset..]
-        // );
-
-        let option_type = endian.read_u16(&buffer[*offset..*offset + 2]);
-
-        debug!("Option type: {}", option_type);
-
-        let option_length = endian.read_u16(&buffer[*offset + 2..*offset + 4]);
-
-        debug!("Option length: {}", option_length);
-
-        if option_type == option_type::END_OF_OPT {
-            *offset += 4;
-            return Ok((option_type, option_length, &[]));
+    /// Read the next complete block into the internal buffer and return its
+    /// type.
+    ///
+    /// On return the buffer holds the complete block, from the block type
+    /// field through the trailing block total length. Returns `Ok(None)` at
+    /// end of input.
+    fn read_next_block(&mut self) -> Result<Option<BlockType>, CaptureError> {
+        let mut block_type_bytes = [0u8; 4];
+        match self.reader.read_exact(&mut block_type_bytes) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
         }
 
-        let option_value = &buffer[*offset + 4..*offset + 4 + option_length as usize];
+        self.buffer.clear();
+        self.buffer.extend_from_slice(&block_type_bytes);
 
-        // The offset is padded to 32 bits, so we need to round up to the next multiple of 4
-        *offset += 4 + option_length.next_multiple_of(4) as usize;
+        let mut length_bytes = [0u8; 4];
+        self.reader.read_exact(&mut length_bytes)?;
+        self.buffer.extend_from_slice(&length_bytes);
 
-        Ok((option_type, option_length, option_value))
-    }
-
-    fn read_section_header(&mut self) -> Result<SectionHeader, CaptureError> {
-        let mut block_total_length_bytes = [0u8; 4];
-        let mut byte_order_bytes = [0u8; 4];
-
-        self.reader.read_exact(&mut block_total_length_bytes)?;
-        self.reader.read_exact(&mut byte_order_bytes)?;
-
-        let mut section_header = SectionHeader {
-            endian: if byte_order_bytes == [0x1A, 0x2B, 0x3C, 0x4D] {
+        let (block_type, endian) = if block_type_bytes == [0x0A, 0x0D, 0x0D, 0x0A] {
+            // A section header carries its own byte-order magic right after
+            // the length field.
+            let mut byte_order_bytes = [0u8; 4];
+            self.reader.read_exact(&mut byte_order_bytes)?;
+            self.buffer.extend_from_slice(&byte_order_bytes);
+            let endian = if byte_order_bytes == [0x1A, 0x2B, 0x3C, 0x4D] {
                 Endian::Big
             } else {
                 Endian::Little
-            },
-            ..Default::default()
+            };
+            (BlockType::SectionHeader, endian)
+        } else {
+            // Not a section header, we need to use the current section header
+            // to determine the endianness
+            let section = self
+                .section
+                .as_ref()
+                .ok_or(CaptureError::InvalidMagicNumber(u32::from_be_bytes(
+                    block_type_bytes,
+                )))?;
+            (
+                BlockType::from(section.endian.read_u32(&block_type_bytes)),
+                section.endian,
+            )
         };
 
-        let block_total_length = section_header.endian.read_u32(&block_total_length_bytes);
-
-        // Read the rest of the section header block, excluding the first 12 bytes (block type, block total length, and byte order magic)
-        let mut buffer: Vec<u8> = vec![0u8; (block_total_length - 12) as usize];
-        self.reader.read_exact(&mut buffer)?;
-
-        section_header.major_version = section_header.endian.read_u16(&buffer[0..2]);
-        section_header.minor_version = section_header.endian.read_u16(&buffer[2..4]);
-        section_header.section_length = section_header.endian.read_i64(&buffer[4..12]);
-
-        let mut position = 12;
-
-        while position < buffer.len() - 4 {
-            let (option_type, _option_length, option_value) =
-                Self::read_option(&buffer, section_header.endian, &mut position)?;
-
-            match option_type {
-                option_type::END_OF_OPT => {
-                    break;
-                }
-
-                option_type::SHB_HARDWARE => {
-                    section_header.hardware = Some(String::from_utf8(option_value.to_vec())?)
-                }
-
-                option_type::SHB_OS => {
-                    section_header.os = Some(String::from_utf8(option_value.to_vec())?)
-                }
-
-                option_type::SHB_USER_APPL => {
-                    section_header.user_appl = Some(String::from_utf8(option_value.to_vec())?)
-                }
-
-                _ => {
-                    // Skip unknown / unsupported option types
-                }
-            }
+        let block_total_length = endian.read_u32(&length_bytes) as usize;
+        if block_total_length < self.buffer.len() {
+            return Err(CaptureError::InvalidPcapngBlockTotalLength(
+                block_total_length as u32,
+            ));
         }
 
-        self.section = Some(section_header.clone());
-
-        // Read the trailing block total length from the last 4 bytes of the buffer
-        let trailing_block_total_length_bytes: [u8; 4] = buffer[buffer.len() - 4..].try_into()?;
-
-        // Check that the trailing block total length matches the initial block total length
-        let trailing_block_total_length = section_header
-            .endian
-            .read_u32(&trailing_block_total_length_bytes);
-
-        if block_total_length != trailing_block_total_length {
-            error!(
-                "Section header block total length mismatch: {} != {}",
-                block_total_length, trailing_block_total_length
-            );
-        }
-
-        Ok(section_header)
-    }
-
-    fn read_interface_description(&mut self) -> Result<InterfaceDescription, CaptureError> {
-        let mut interface = InterfaceDescription::default();
-        let endian = self
-            .section
-            .as_ref()
-            .expect("No section header found")
-            .endian;
-
-        let mut block_total_length_bytes = [0u8; 4];
-        self.reader.read_exact(&mut block_total_length_bytes)?;
-        let block_total_length = endian.read_u32(&block_total_length_bytes);
-
-        // Read the rest of the interface description block, excluding the first 8 bytes (block type and block total length)
-        let mut buffer: Vec<u8> = vec![0u8; (block_total_length - 8) as usize];
-        self.reader.read_exact(&mut buffer)?;
-
-        interface.link_type = LinkType::from(endian.read_u16(&buffer[0..2]));
-        interface.snap_len = endian.read_u32(&buffer[4..8]);
-
-        let mut position = 8;
-
-        while position < buffer.len() - 4 {
-            let (option_type, _option_length, option_value) =
-                Self::read_option(&buffer, endian, &mut position)?;
-
-            match option_type {
-                option_type::END_OF_OPT => {
-                    break;
-                }
-
-                option_type::IF_NAME => {
-                    interface.name = Some(String::from_utf8(option_value.to_vec())?)
-                }
-
-                option_type::IF_DESCRIPTION => {
-                    interface.description = Some(String::from_utf8(option_value.to_vec())?)
-                }
-
-                option_type::IF_IPV4_ADDR => interface.ipv4_addr.push((
-                    Ipv4Addr::new(
-                        option_value[0],
-                        option_value[1],
-                        option_value[2],
-                        option_value[3],
-                    ),
-                    Ipv4Addr::new(
-                        option_value[4],
-                        option_value[5],
-                        option_value[6],
-                        option_value[7],
-                    ),
-                )),
-
-                option_type::IF_IPV6_ADDR => {
-                    let addr = Ipv6Addr::from_octets(option_value[0..16].try_into()?);
-                    let prefix_len = option_value[16];
-                    interface.ipv6_addr.push((addr, prefix_len));
-                }
-
-                option_type::IF_MAC_ADDR => {
-                    interface.mac_addr = Some(EthAddr::from_slice(option_value));
-                }
-
-                option_type::IF_EUI_ADDR => {
-                    interface.eui_addr = Some(option_value.try_into()?);
-                }
-
-                option_type::IF_SPEED => {
-                    interface.speed = Some(endian.read_u64(option_value));
-                }
-
-                option_type::IF_TSRESOL => {
-                    interface.tsresol = Some(option_value[0]);
-                }
-
-                option_type::IF_TZONE => {
-                    interface.tzone = Some(endian.read_i32(option_value));
-                }
-
-                option_type::IF_FILTER => {
-                    interface.filter = option_value.to_vec();
-                }
-
-                option_type::IF_OS => {
-                    interface.os = Some(String::from_utf8(option_value.to_vec())?)
-                }
-
-                option_type::IF_FCSLEN => {
-                    interface.fcs_len = Some(option_value[0]);
-                }
-
-                option_type::IF_TSOFFSET => {
-                    interface.tsoffset = Some(endian.read_i64(option_value));
-                }
-
-                option_type::IF_HARDWARE => {
-                    interface.hardware = Some(String::from_utf8(option_value.to_vec())?)
-                }
-
-                option_type::IF_TXSPEED => {
-                    interface.txspeed = Some(endian.read_u64(option_value));
-                }
-
-                option_type::IF_RXSPEED => {
-                    interface.rxspeed = Some(endian.read_u64(option_value));
-                }
-
-                option_type::IF_IANA_TZNAME => {
-                    interface.iana_tzname = Some(String::from_utf8(option_value.to_vec())?)
-                }
-
-                _ => {
-                    // Skip unknown / unsupported option types
-                }
-            }
-        }
-
-        self.interfaces.push(interface.clone());
-
-        // Read the trailing block total length from the last 4 bytes of the buffer
-        let trailing_block_total_length_bytes: [u8; 4] = buffer[buffer.len() - 4..].try_into()?;
-
-        // Check that the trailing block total length matches the initial block total length
-        let trailing_block_total_length = endian.read_u32(&trailing_block_total_length_bytes);
-
-        if block_total_length != trailing_block_total_length {
-            error!(
-                "Interface description block total length mismatch: {} != {}",
-                block_total_length, trailing_block_total_length
-            );
-        }
-
-        Ok(interface)
-    }
-
-    fn read_simple_packet(&mut self) -> Result<SimplePacketHeader, CaptureError> {
-        let endian = self
-            .section
-            .as_ref()
-            .expect("No section header found")
-            .endian;
-
-        let mut block_total_length_bytes = [0u8; 4];
-        self.reader.read_exact(&mut block_total_length_bytes)?;
-
-        let block_total_length = endian.read_u32(&block_total_length_bytes);
-
-        // Read the original packet length
-        let mut original_len_bytes = [0u8; 4];
-        self.reader.read_exact(&mut original_len_bytes)?;
-        let original_len = endian.read_u32(&original_len_bytes);
-
-        // Read the packet data into the internal buffer
-        self.buffer.resize((block_total_length - 16) as usize, 0);
-        self.reader.read_exact(&mut self.buffer)?;
-
-        // Read the trailing block total length from the last 4 bytes of the buffer
-        let trailing_block_total_length_bytes: [u8; 4] =
-            self.buffer[self.buffer.len() - 4..].try_into()?;
-
-        // Check that the trailing block total length matches the initial block total length
-        let trailing_block_total_length = endian.read_u32(&trailing_block_total_length_bytes);
-
-        if block_total_length != trailing_block_total_length {
-            error!(
-                "Simple packet block total length mismatch: {} != {}",
-                block_total_length, trailing_block_total_length
-            );
-        }
-
-        Ok(SimplePacketHeader { original_len })
-    }
-
-    fn read_enhanced_packet(&mut self) -> Result<EnhancedPacketHeaderOptions, CaptureError> {
-        let mut enhanced_packet = EnhancedPacketHeaderOptions::default();
-        let endian = self
-            .section
-            .as_ref()
-            .expect("No section header found")
-            .endian;
-
-        let mut block_total_length_bytes = [0u8; 4];
-        self.reader.read_exact(&mut block_total_length_bytes)?;
-        let block_total_length = endian.read_u32(&block_total_length_bytes);
-
-        let mut header_bytes = [0u8; 20];
-        self.reader.read_exact(&mut header_bytes)?;
-
-        enhanced_packet.interface_id = endian.read_u32(&header_bytes[0..4]);
-        enhanced_packet.timestamp_high = endian.read_u32(&header_bytes[4..8]);
-        enhanced_packet.timestamp_low = endian.read_u32(&header_bytes[8..12]);
-        enhanced_packet.captured_len = endian.read_u32(&header_bytes[12..16]);
-        enhanced_packet.original_len = endian.read_u32(&header_bytes[16..20]);
-
-        // The packet data is padded to 32 bits, so we need to skip the padding bytes
-        let padded_length = enhanced_packet.captured_len.next_multiple_of(4);
-
-        // Read the packet data into the internal buffer
-        self.buffer.resize(padded_length as usize, 0);
-        self.reader.read_exact(&mut self.buffer)?;
-
-        // Resize the buffer to the actual captured length
-        self.buffer.resize(enhanced_packet.captured_len as usize, 0);
-
-        // Read the options, if any
-        let mut buffer = vec![0u8; (block_total_length - 32 - padded_length) as usize];
-        self.reader.read_exact(&mut buffer)?;
-
-        let mut position = 0;
-        while position < buffer.len() {
-            let (option_type, _option_length, option_value) =
-                Self::read_option(&buffer, endian, &mut position)?;
-
-            match option_type {
-                option_type::END_OF_OPT => {
-                    break;
-                }
-
-                option_type::EPB_FLAGS => {
-                    enhanced_packet.flags = Some(endian.read_u32(option_value));
-                }
-
-                option_type::EPB_HASH => {
-                    enhanced_packet.hash.push(option_value.to_vec());
-                }
-
-                option_type::EPB_DROPCOUNT => {
-                    enhanced_packet.drop_count = Some(endian.read_u64(option_value));
-                }
-
-                option_type::EPB_PACKET_ID => {
-                    enhanced_packet.packet_id = Some(endian.read_u64(option_value));
-                }
-
-                option_type::EPB_QUEUE => {
-                    enhanced_packet.queue = Some(endian.read_u32(option_value));
-                }
-
-                option_type::EPB_VERDICT => {
-                    enhanced_packet.verdict.push(option_value.to_vec());
-                }
-
-                option_type::EPB_PROCESSID_THREADID => {
-                    let process_id = endian.read_u32(&option_value[0..4]);
-                    let thread_id = endian.read_u32(&option_value[4..8]);
-                    enhanced_packet.processid_threadid = Some((process_id, thread_id));
-                }
-
-                _ => {
-                    // Skip unknown / unsupported option types
-                }
-            }
-        }
-
-        // Read the trailing block total length from the reader
-        let mut trailing_block_total_length_bytes = [0u8; 4];
-        self.reader
-            .read_exact(&mut trailing_block_total_length_bytes)?;
-
-        // Check that the trailing block total length matches the initial block total length
-        let trailing_block_total_length = endian.read_u32(&trailing_block_total_length_bytes);
-
-        if block_total_length != trailing_block_total_length {
-            error!(
-                "Enhanced packet block total length mismatch: {} != {}",
-                block_total_length, trailing_block_total_length
-            );
-        }
-
-        Ok(enhanced_packet)
-    }
-
-    fn read_unsupported_block(&mut self) -> Result<PcapngBlock<'_>, CaptureError> {
-        let endian = self
-            .section
-            .as_ref()
-            .expect("No section header found")
-            .endian;
-
-        let mut block_total_length_bytes = [0u8; 4];
-        self.reader.read_exact(&mut block_total_length_bytes)?;
-        let block_total_length = endian.read_u32(&block_total_length_bytes);
-
-        self.buffer.resize((block_total_length - 8) as usize, 0);
-        self.reader.read_exact(&mut self.buffer)?;
-
-        Ok(PcapngBlock::Raw {
-            block_type: BlockType::Unknown(u32::from_be_bytes(block_total_length_bytes)),
-            data: Cow::Borrowed(&self.buffer),
-        })
+        let position = self.buffer.len();
+        self.buffer.resize(block_total_length, 0);
+        self.reader.read_exact(&mut self.buffer[position..])?;
+
+        Ok(Some(block_type))
     }
 
     /// Read blocks until the next packet record is found.
@@ -1068,7 +1052,7 @@ impl<R: Read> PcapngReader<R> {
     /// unsupported. Returns `Ok(None)` at end of file.
     pub fn next_packet(&mut self) -> Result<Option<PacketRecord<'_>>, CaptureError> {
         loop {
-            let block_type = match self.next_block_type()? {
+            let block_type = match self.read_next_block()? {
                 Some(block_type) => block_type,
                 None => return Ok(None),
             };
@@ -1077,35 +1061,44 @@ impl<R: Read> PcapngReader<R> {
 
             match block_type {
                 BlockType::SectionHeader => {
-                    self.read_section_header()?;
+                    self.section = Some(SectionHeader::parse(&self.buffer)?);
                 }
 
                 BlockType::InterfaceDescription => {
-                    self.read_interface_description()?;
+                    let endian = self
+                        .section
+                        .as_ref()
+                        .expect("No section header found")
+                        .endian;
+                    let interface = InterfaceDescription::parse(&self.buffer, endian)?;
+                    self.interfaces.push(interface);
                 }
 
                 BlockType::SimplePacket => {
-                    error!("Simple Packet Block");
-
-                    let spb = self.read_simple_packet()?;
+                    let endian = self
+                        .section
+                        .as_ref()
+                        .expect("No section header found")
+                        .endian;
+                    let (spb, data) = SimplePacketHeader::parse(&self.buffer, endian)?;
                     if let Some(interface) = self.interface_descriptions().first() {
-                        return Ok(Some(
-                            spb.into_packet_record(interface, self.buffer.as_slice()),
-                        ));
+                        return Ok(Some(spb.into_packet_record(interface, data)));
                     } else {
                         return Err(CaptureError::MissingPcapngInterfaceDescriptionBlock);
                     }
                 }
 
                 BlockType::EnhancedPacket => {
-                    let epb = self.read_enhanced_packet()?;
-
+                    let endian = self
+                        .section
+                        .as_ref()
+                        .expect("No section header found")
+                        .endian;
+                    let (epb, data) = EnhancedPacketHeaderOptions::parse(&self.buffer, endian)?;
                     if let Some(interface) =
                         self.interface_descriptions().get(epb.interface_id as usize)
                     {
-                        return Ok(Some(
-                            epb.into_packet_record(interface, self.buffer.as_slice()),
-                        ));
+                        return Ok(Some(epb.into_packet_record(interface, data)));
                     } else {
                         return Err(CaptureError::InvalidPcapngPacketInterfaceId(
                             epb.interface_id,
@@ -1116,7 +1109,6 @@ impl<R: Read> PcapngReader<R> {
                 _ => {
                     // Skip other blocks
                     trace!("Skipping unsupported block type: {:?}", block_type);
-                    self.read_unsupported_block()?;
                 }
             }
         }
@@ -1138,6 +1130,241 @@ impl<R: Read> CaptureReader for PcapngReader<R> {
     }
 }
 
+/// A pcapng block read from a slice: its byte offset, complete raw bytes, and
+/// parsed content.
+#[derive(Debug)]
+pub struct PcapngBlockRecord<'a> {
+    /// Byte offset of the block in the input slice
+    pub offset: usize,
+
+    /// Complete raw block bytes, from the block type field through the
+    /// trailing block total length
+    pub raw: &'a [u8],
+
+    /// Parsed block content borrowing from `raw`
+    pub block: PcapngBlock<'a>,
+}
+
+/// # Zero-copy PCAPNG reader over a byte slice
+///
+/// `PcapngSliceReader` parses a PCAPNG capture held entirely in memory —
+/// typically an `mmap`-backed slice — without copying packet bytes. Blocks
+/// and records borrow from the input slice with lifetime `'a` rather than
+/// from the reader itself, so they can be held across subsequent reads.
+///
+/// Every block is returned with its byte offset and complete raw bytes,
+/// enabling index-then-copy workflows such as reordering packet blocks by
+/// timestamp while copying them verbatim.
+#[derive(Debug)]
+pub struct PcapngSliceReader<'a> {
+    /// The latest section header
+    pub section: Option<SectionHeader>,
+
+    /// The interfaces
+    pub interfaces: Vec<InterfaceDescription>,
+
+    /// The underlying capture bytes
+    data: &'a [u8],
+
+    /// Offset of the next block
+    pos: usize,
+}
+
+impl<'a> PcapngSliceReader<'a> {
+    /// Create a reader over a complete in-memory PCAPNG capture.
+    ///
+    /// Parsing is lazy: section and interface state is built up as blocks are
+    /// read.
+    pub fn new(data: &'a [u8]) -> Result<Self, CaptureError> {
+        Ok(Self {
+            section: None,
+            interfaces: Vec::new(),
+            data,
+            pos: 0,
+        })
+    }
+
+    /// Return the byte offset at which the next block starts.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// Return the most recently parsed section header, if any.
+    pub fn section(&self) -> Option<&SectionHeader> {
+        self.section.as_ref()
+    }
+
+    /// Return all interface descriptions parsed in the current reader state.
+    pub fn interface_descriptions(&self) -> &[InterfaceDescription] {
+        &self.interfaces
+    }
+
+    /// Read the next pcapng block, borrowing directly from the input slice.
+    ///
+    /// Returns `Ok(None)` when the slice is exhausted.
+    pub fn next_block(&mut self) -> Result<Option<PcapngBlockRecord<'a>>, CaptureError> {
+        let remaining: &'a [u8] = &self.data[self.pos..];
+        if remaining.is_empty() {
+            return Ok(None);
+        }
+        if remaining.len() < 12 {
+            return Err(CaptureError::TruncatedCapture("pcapng block"));
+        }
+
+        let block_type_bytes: [u8; 4] = remaining[0..4].try_into().unwrap();
+        let (block_type, endian) = if block_type_bytes == [0x0A, 0x0D, 0x0D, 0x0A] {
+            // A section header carries its own byte-order magic right after
+            // the length field.
+            let endian = if remaining[8..12] == [0x1A, 0x2B, 0x3C, 0x4D] {
+                Endian::Big
+            } else {
+                Endian::Little
+            };
+            (BlockType::SectionHeader, endian)
+        } else {
+            // Not a section header, we need to use the current section header
+            // to determine the endianness
+            let section = self
+                .section
+                .as_ref()
+                .ok_or(CaptureError::InvalidMagicNumber(u32::from_be_bytes(
+                    block_type_bytes,
+                )))?;
+            (
+                BlockType::from(section.endian.read_u32(&block_type_bytes)),
+                section.endian,
+            )
+        };
+
+        let block_total_length = endian.read_u32(&remaining[4..8]) as usize;
+        if block_total_length < 12 || remaining.len() < block_total_length {
+            return Err(CaptureError::TruncatedCapture("pcapng block"));
+        }
+
+        let offset = self.pos;
+        let raw = &remaining[..block_total_length];
+        self.pos += block_total_length;
+
+        let block = match block_type {
+            BlockType::SectionHeader => {
+                let section_header = SectionHeader::parse(raw)?;
+                self.section = Some(section_header.clone());
+                PcapngBlock::SectionHeader(section_header)
+            }
+
+            BlockType::InterfaceDescription => {
+                let interface = InterfaceDescription::parse(raw, endian)?;
+                self.interfaces.push(interface.clone());
+                PcapngBlock::InterfaceDescription(interface)
+            }
+
+            BlockType::SimplePacket => {
+                let (header, data) = SimplePacketHeader::parse(raw, endian)?;
+                PcapngBlock::SimplePacket(SimplePacket {
+                    header,
+                    packet_data: Cow::Borrowed(data),
+                })
+            }
+
+            BlockType::EnhancedPacket => {
+                let (header_options, data) = EnhancedPacketHeaderOptions::parse(raw, endian)?;
+                PcapngBlock::EnhancedPacket(EnhancedPacket {
+                    header_options,
+                    packet_data: Cow::Borrowed(data),
+                })
+            }
+
+            _ => PcapngBlock::Raw {
+                block_type,
+                data: Cow::Borrowed(&raw[8..]),
+            },
+        };
+
+        Ok(Some(PcapngBlockRecord { offset, raw, block }))
+    }
+
+    /// Read blocks until the next packet record is found, borrowing directly
+    /// from the input slice.
+    ///
+    /// Unlike the [`CaptureReader`] implementation, records returned by this
+    /// inherent method are tied to the input slice's lifetime `'a` rather
+    /// than to the borrow of the reader, so they may be held across later
+    /// reads.
+    pub fn next_packet(&mut self) -> Result<Option<PacketRecord<'a>>, CaptureError> {
+        match self.next_packet_with_offset()? {
+            Some(located) => Ok(Some(located.packet)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read blocks until the next packet record is found, returning it along
+    /// with the offset and raw bytes of its source block.
+    pub fn next_packet_with_offset(
+        &mut self,
+    ) -> Result<Option<LocatedPacketRecord<'a>>, CaptureError> {
+        loop {
+            let Some(record) = self.next_block()? else {
+                return Ok(None);
+            };
+
+            match record.block {
+                PcapngBlock::SimplePacket(sp) => {
+                    let data = match sp.packet_data {
+                        Cow::Borrowed(data) => data,
+                        Cow::Owned(_) => unreachable!("slice reader never owns packet data"),
+                    };
+                    if let Some(interface) = self.interfaces.first() {
+                        return Ok(Some(LocatedPacketRecord {
+                            offset: record.offset,
+                            raw: record.raw,
+                            packet: sp.header.into_packet_record(interface, data),
+                        }));
+                    } else {
+                        return Err(CaptureError::MissingPcapngInterfaceDescriptionBlock);
+                    }
+                }
+
+                PcapngBlock::EnhancedPacket(ep) => {
+                    let data = match ep.packet_data {
+                        Cow::Borrowed(data) => data,
+                        Cow::Owned(_) => unreachable!("slice reader never owns packet data"),
+                    };
+                    if let Some(interface) =
+                        self.interfaces.get(ep.header_options.interface_id as usize)
+                    {
+                        return Ok(Some(LocatedPacketRecord {
+                            offset: record.offset,
+                            raw: record.raw,
+                            packet: ep.header_options.into_packet_record(interface, data),
+                        }));
+                    } else {
+                        return Err(CaptureError::InvalidPcapngPacketInterfaceId(
+                            ep.header_options.interface_id,
+                        ));
+                    }
+                }
+
+                _ => {
+                    // Skip non-packet blocks
+                }
+            }
+        }
+    }
+}
+
+impl<'a> CaptureReader for PcapngSliceReader<'a> {
+    fn interfaces(&self) -> Vec<interface::Interface> {
+        self.interfaces
+            .iter()
+            .map(|idb| idb.to_interface())
+            .collect()
+    }
+
+    fn next_packet(&mut self) -> Result<Option<PacketRecord<'_>>, CaptureError> {
+        self.next_packet()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -1145,6 +1372,54 @@ mod tests {
     use crate::packet::{Packet, layer::eth::Eth};
 
     use super::*;
+
+    const SHB: [u8; 28] = [
+        0x0A, 0x0D, 0x0D, 0x0A, // Block Type: Section Header
+        0x00, 0x00, 0x00, 0x1C, // Block Total Length: 28
+        0x1A, 0x2B, 0x3C, 0x4D, // Byte-Order Magic: big-endian
+        0x00, 0x01, // Major Version: 1
+        0x00, 0x00, // Minor Version: 0
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Section Length: -1
+        0x00, 0x00, 0x00, 0x1C, // Block Total Length: 28
+    ];
+    const IDB: [u8; 20] = [
+        0x00, 0x00, 0x00, 0x01, // Block Type: Interface Description
+        0x00, 0x00, 0x00, 0x14, // Block Total Length: 20
+        0x00, 0x01, // LinkType: Ethernet (1)
+        0x00, 0x00, // Reserved
+        0x00, 0x00, 0x04, 0x00, // SnapLen: 1024
+        0x00, 0x00, 0x00, 0x14, // Block Total Length: 20
+    ];
+    const EPB: [u8; 80] = [
+        0x00, 0x00, 0x00, 0x06, // Block Type: Enhanced Packet
+        0x00, 0x00, 0x00, 0x50, // Block Total Length: 80
+        0x00, 0x00, 0x00, 0x00, // Interface ID: 0
+        0x00, 0x03, 0x7C, 0x58, // Timestamp (High)
+        0x75, 0xE1, 0x2A, 0x94, // Timestamp (Low)
+        0x00, 0x00, 0x00, 0x2E, // Captured Len: 46
+        0x00, 0x00, 0x00, 0x2E, // Original Len: 46
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, // Dst MAC
+        0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, // Src MAC
+        0x08, 0x00, // Ethertype: IPv4
+        0x45, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, // IPv4 header
+        0x40, 0x11, 0x00, 0x00, 10, 0, 1, 1, 10, 0, 1, 2, //
+        0x04, 0xd2, 0x04, 0xd3, 0x00, 0x0c, 0x00, 0x00, // UDP header
+        0x01, 0x02, 0x03, 0x04, // Payload
+        0x00, 0x00, // Padding
+        0x00, 0x00, 0x00, 0x50, // Block Total Length: 80
+    ];
+
+    /// SHB + IDB + two EPBs, the second one microsecond later.
+    fn slice_test_data() -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&SHB);
+        data.extend_from_slice(&IDB);
+        data.extend_from_slice(&EPB);
+        let mut epb2 = EPB;
+        epb2[19] += 1; // Timestamp (Low) + 1 microsecond
+        data.extend_from_slice(&epb2);
+        data
+    }
 
     #[test]
     fn epb_calc_timestamp() {
@@ -1285,5 +1560,99 @@ mod tests {
         let udp = packet.layer_viewer(crate::packet::layer::udp::Udp).unwrap();
         assert_eq!(udp.src_port(), 1234);
         assert_eq!(udp.dst_port(), 1235);
+    }
+
+    #[test]
+    fn pcapng_slice_reader() {
+        let data = slice_test_data();
+
+        // Block-level access carries offsets and complete raw bytes.
+        let mut reader = PcapngSliceReader::new(&data).unwrap();
+        let shb = reader.next_block().unwrap().unwrap();
+        assert_eq!(shb.offset, 0);
+        assert_eq!(shb.raw, SHB);
+        assert!(matches!(shb.block, PcapngBlock::SectionHeader(_)));
+        let idb = reader.next_block().unwrap().unwrap();
+        assert_eq!(idb.offset, 28);
+        assert!(matches!(idb.block, PcapngBlock::InterfaceDescription(_)));
+        let epb = reader.next_block().unwrap().unwrap();
+        assert_eq!(epb.offset, 48);
+        assert_eq!(epb.raw.len(), 80);
+
+        // Packet records borrow from the slice and can be held across reads.
+        let mut reader = PcapngSliceReader::new(&data).unwrap();
+        let first = reader.next_packet_with_offset().unwrap().unwrap();
+        let second = reader.next_packet_with_offset().unwrap().unwrap();
+        assert_eq!(first.offset, 48);
+        assert_eq!(first.raw.len(), 80);
+        assert!(matches!(first.packet.data, Cow::Borrowed(_)));
+        assert_eq!(first.packet.timestamp, 981144306789012000);
+        assert_eq!(first.packet.link_type, LinkType::Ethernet);
+        assert_eq!(first.packet.original_length, 46);
+        assert_eq!(second.offset, 48 + 80);
+        assert_eq!(second.packet.timestamp, 981144306789013000);
+        assert!(reader.next_packet().unwrap().is_none());
+
+        // Generic code can still use the CaptureReader trait.
+        let mut reader = PcapngSliceReader::new(&data).unwrap();
+        assert!(CaptureReader::next_packet(&mut reader).unwrap().is_some());
+        assert_eq!(CaptureReader::interfaces(&reader).len(), 1);
+
+        // Truncated captures are reported as errors.
+        let mut reader = PcapngSliceReader::new(&data[..data.len() - 1]).unwrap();
+        reader.next_packet().unwrap();
+        assert!(reader.next_packet().is_err());
+    }
+
+    #[test]
+    fn pcapng_block_total_length_mismatch() {
+        // SHB with a corrupted trailing block total length.
+        let data: [u8; 28] = [
+            0x0A, 0x0D, 0x0D, 0x0A, // Block Type: Section Header
+            0x00, 0x00, 0x00, 0x1C, // Block Total Length: 28
+            0x1A, 0x2B, 0x3C, 0x4D, // Byte-Order Magic: big-endian
+            0x00, 0x01, // Major Version: 1
+            0x00, 0x00, // Minor Version: 0
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Section Length: -1
+            0x00, 0x00, 0x00, 0x1D, // Block Total Length: 29 (mismatch)
+        ];
+
+        let mut slice_reader = PcapngSliceReader::new(&data).unwrap();
+        assert!(slice_reader.next_block().is_err());
+
+        let mut stream_reader = PcapngReader::new(Cursor::new(&data)).unwrap();
+        assert!(stream_reader.next_block().is_err());
+    }
+
+    #[test]
+    fn pcapng_slice_reader_matches_streaming_reader() {
+        let data = slice_test_data();
+
+        let mut streaming = PcapngReader::new(Cursor::new(&data)).unwrap();
+        let mut streamed = Vec::new();
+        while let Some(record) = streaming.next_packet().unwrap() {
+            streamed.push(record.to_owned());
+        }
+
+        let mut slice = PcapngSliceReader::new(&data).unwrap();
+        let mut sliced = Vec::new();
+        while let Some(record) = slice.next_packet().unwrap() {
+            sliced.push(record);
+        }
+
+        assert_eq!(streamed, sliced);
+    }
+
+    #[test]
+    fn pcapng_slice_reader_survives_truncation() {
+        let data = slice_test_data();
+
+        // Every prefix must yield either clean results or an error, never a
+        // panic.
+        for len in 0..=data.len() {
+            if let Ok(mut reader) = PcapngSliceReader::new(&data[..len]) {
+                while let Ok(Some(_)) = reader.next_block() {}
+            }
+        }
     }
 }

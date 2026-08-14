@@ -5,7 +5,8 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use log::debug;
 
 use crate::capture::{
-    CaptureError, CaptureReader, interface::Interface, link_type::LinkType, packet::PacketRecord,
+    CaptureError, CaptureReader, endian::Endian, interface::Interface, link_type::LinkType,
+    packet::{LocatedPacketRecord, PacketRecord},
 };
 
 /// PCAP global header magic numbers.
@@ -73,9 +74,62 @@ pub struct PcapHeader {
 }
 
 impl PcapHeader {
+    /// Length in bytes of the serialized global header.
+    pub const LEN: usize = 24;
+
+    /// Parse a global header from the first [`LEN`](Self::LEN) bytes of `data`.
+    ///
+    /// The magic number selects byte order and timestamp precision; both are
+    /// recoverable from the returned header via [`is_big_endian`](Self::is_big_endian)
+    /// and [`is_nanosecond`](Self::is_nanosecond).
+    pub fn parse(data: &[u8]) -> Result<Self, CaptureError> {
+        if data.len() < Self::LEN {
+            return Err(CaptureError::TruncatedCapture("pcap global header"));
+        }
+
+        let magic_number = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let endian = match magic_number {
+            magic::BE_USEC | magic::BE_NSEC => Endian::Big,
+            magic::LE_USEC | magic::LE_NSEC => Endian::Little,
+            _ => return Err(CaptureError::InvalidMagicNumber(magic_number)),
+        };
+
+        Ok(Self {
+            magic_number,
+            major_version: endian.read_u16(&data[4..]),
+            minor_version: endian.read_u16(&data[6..]),
+            reserved_1: endian.read_u32(&data[8..]),
+            reserved_2: endian.read_u32(&data[12..]),
+            snap_len: endian.read_u32(&data[16..]),
+            additional_info_link_type: endian.read_u32(&data[20..]),
+        })
+    }
+
     /// Return the link-layer type stored in the lower 16 bits of the header.
     pub fn link_type(&self) -> LinkType {
         ((self.additional_info_link_type & 0xFFFF) as u16).into()
+    }
+
+    /// Return the byte order used by multi-byte fields in this file.
+    pub fn endian(&self) -> Endian {
+        if self.is_big_endian() {
+            Endian::Big
+        } else {
+            Endian::Little
+        }
+    }
+
+    /// Build the interface metadata described by this global header.
+    pub fn to_interface(&self) -> Interface {
+        Interface {
+            link_type: self.link_type(),
+            snap_len: self.snap_len,
+            resolution: if self.is_nanosecond() {
+                crate::capture::interface::Resolution::PowerOfTen(9)
+            } else {
+                crate::capture::interface::Resolution::PowerOfTen(6)
+            },
+        }
     }
 
     /// Return whether multi-byte fields in this file use big-endian encoding.
@@ -117,6 +171,22 @@ pub struct PcapPacketHeader {
 }
 
 impl PcapPacketHeader {
+    /// Length in bytes of the serialized packet header.
+    pub const LEN: usize = 16;
+
+    /// Parse a packet header from the first [`LEN`](Self::LEN) bytes of `data`
+    /// using the capture's byte order.
+    ///
+    /// Callers must ensure `data` holds at least [`LEN`](Self::LEN) bytes.
+    pub fn parse(data: &[u8], endian: Endian) -> Self {
+        Self {
+            ts_sec: endian.read_u32(&data[0..]),
+            ts_usec: endian.read_u32(&data[4..]),
+            incl_len: endian.read_u32(&data[8..]),
+            orig_len: endian.read_u32(&data[12..]),
+        }
+    }
+
     /// Convert to universal Packet representation
     pub fn to_packet<'a>(
         &self,
@@ -183,51 +253,14 @@ impl<R: Read> PcapReader<R> {
     pub fn new(reader: R) -> Result<Self, CaptureError> {
         let mut reader = BufReader::new(reader);
 
-        let mut magic_bytes = [0u8; 4];
-        reader.read_exact(&mut magic_bytes)?;
-        let magic_number = u32::from_be_bytes(magic_bytes);
-
-        let (big_endian, nanosecond) = match magic_number {
-            magic::BE_USEC => (true, false),
-            magic::BE_NSEC => (true, true),
-            magic::LE_USEC => (false, false),
-            magic::LE_NSEC => (false, true),
-            _ => return Err(CaptureError::InvalidMagicNumber(magic_number)),
-        };
-
-        let mut buffer = [0u8; 20];
+        let mut buffer = [0u8; PcapHeader::LEN];
         reader.read_exact(&mut buffer)?;
-
-        let header = if big_endian {
-            PcapHeader {
-                magic_number,
-                major_version: u16::from_be_bytes([buffer[0], buffer[1]]),
-                minor_version: u16::from_be_bytes([buffer[2], buffer[3]]),
-                reserved_1: u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]),
-                reserved_2: u32::from_be_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]),
-                snap_len: u32::from_be_bytes([buffer[12], buffer[13], buffer[14], buffer[15]]),
-                additional_info_link_type: u32::from_be_bytes([
-                    buffer[16], buffer[17], buffer[18], buffer[19],
-                ]),
-            }
-        } else {
-            PcapHeader {
-                magic_number,
-                major_version: u16::from_le_bytes([buffer[0], buffer[1]]),
-                minor_version: u16::from_le_bytes([buffer[2], buffer[3]]),
-                reserved_1: u32::from_le_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]),
-                reserved_2: u32::from_le_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]),
-                snap_len: u32::from_le_bytes([buffer[12], buffer[13], buffer[14], buffer[15]]),
-                additional_info_link_type: u32::from_le_bytes([
-                    buffer[16], buffer[17], buffer[18], buffer[19],
-                ]),
-            }
-        };
+        let header = PcapHeader::parse(&buffer)?;
 
         Ok(Self {
+            big_endian: header.is_big_endian(),
+            nanosecond: header.is_nanosecond(),
             header,
-            big_endian,
-            nanosecond,
             reader,
             buffer: Vec::new(),
         })
@@ -239,28 +272,15 @@ impl<R: Read> PcapReader<R> {
     /// reader's internal buffer and is valid until the next read from this
     /// reader.
     pub fn read_packet_raw(&mut self) -> Result<Option<(PcapPacketHeader, &[u8])>, CaptureError> {
-        let mut buffer = [0u8; 16];
+        let mut buffer = [0u8; PcapPacketHeader::LEN];
         match self.reader.read_exact(&mut buffer) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e.into()),
         }
 
-        let header = if self.big_endian {
-            PcapPacketHeader {
-                ts_sec: u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]),
-                ts_usec: u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]),
-                incl_len: u32::from_be_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]),
-                orig_len: u32::from_be_bytes([buffer[12], buffer[13], buffer[14], buffer[15]]),
-            }
-        } else {
-            PcapPacketHeader {
-                ts_sec: u32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]),
-                ts_usec: u32::from_le_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]),
-                incl_len: u32::from_le_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]),
-                orig_len: u32::from_le_bytes([buffer[12], buffer[13], buffer[14], buffer[15]]),
-            }
-        };
+        let endian = self.header.endian();
+        let header = PcapPacketHeader::parse(&buffer, endian);
 
         if header.incl_len > self.header.snap_len {
             debug!(
@@ -279,15 +299,7 @@ impl<R: Read> PcapReader<R> {
 
 impl<R: Read> CaptureReader for PcapReader<R> {
     fn interfaces(&self) -> Vec<crate::capture::interface::Interface> {
-        vec![Interface {
-            link_type: self.header.link_type(),
-            snap_len: self.header.snap_len,
-            resolution: if self.nanosecond {
-                crate::capture::interface::Resolution::PowerOfTen(9)
-            } else {
-                crate::capture::interface::Resolution::PowerOfTen(6)
-            },
-        }]
+        vec![self.header.to_interface()]
     }
 
     fn next_packet(
@@ -302,6 +314,148 @@ impl<R: Read> CaptureReader for PcapReader<R> {
             }
             None => Ok(None),
         }
+    }
+}
+
+/// A raw packet record as stored in the capture: its byte offset, parsed
+/// packet header, and borrowed packet data.
+#[derive(Debug)]
+pub struct PcapPacketRecord<'a> {
+    /// Byte offset of the record header in the input slice
+    pub offset: usize,
+
+    /// Parsed packet record header
+    pub header: PcapPacketHeader,
+
+    /// Captured packet bytes borrowing from the input slice
+    pub data: &'a [u8],
+}
+
+/// # Zero-copy PCAP reader over a byte slice
+///
+/// `PcapSliceReader` parses a classic PCAP capture held entirely in memory —
+/// typically an `mmap`-backed slice — without copying packet bytes. Records
+/// returned by the inherent [`next_packet`](Self::next_packet) borrow from the
+/// input slice with lifetime `'a` rather than from the reader itself, so they
+/// can be held across subsequent reads, collected, and sorted freely.
+///
+/// The reader also tracks the byte offset of every record, enabling
+/// index-then-copy workflows such as reordering packets by timestamp with
+/// memory bounded by the packet count rather than the capture size.
+#[derive(Debug)]
+pub struct PcapSliceReader<'a> {
+    /// The global header
+    pub header: PcapHeader,
+
+    /// The underlying capture bytes
+    data: &'a [u8],
+
+    /// Offset of the next packet record
+    pos: usize,
+}
+
+impl<'a> PcapSliceReader<'a> {
+    /// Create a reader over a complete in-memory PCAP capture, parsing the
+    /// global header.
+    pub fn new(data: &'a [u8]) -> Result<Self, CaptureError> {
+        let header = PcapHeader::parse(data)?;
+        Ok(Self {
+            header,
+            data,
+            pos: PcapHeader::LEN,
+        })
+    }
+
+    /// Return the byte offset at which the next packet record starts.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// Read the next raw PCAP packet record.
+    ///
+    /// Returns `Ok(None)` when the slice is exhausted. The offset is the byte
+    /// position of the record header within the original slice; the record
+    /// (header plus data) spans `offset..offset + 16 + incl_len`.
+    pub fn read_packet_raw(&mut self) -> Result<Option<PcapPacketRecord<'a>>, CaptureError> {
+        let remaining = &self.data[self.pos..];
+        if remaining.is_empty() {
+            return Ok(None);
+        }
+        if remaining.len() < PcapPacketHeader::LEN {
+            return Err(CaptureError::TruncatedCapture("pcap packet header"));
+        }
+
+        let offset = self.pos;
+        let header = PcapPacketHeader::parse(remaining, self.header.endian());
+
+        if header.incl_len > self.header.snap_len {
+            debug!(
+                "packet's incl_len {} > snap_len {}",
+                header.incl_len, self.header.snap_len
+            );
+        }
+
+        let data_start = self.pos + PcapPacketHeader::LEN;
+        let data_end = data_start + header.incl_len as usize;
+        if data_end > self.data.len() {
+            return Err(CaptureError::TruncatedCapture("pcap packet data"));
+        }
+        self.pos = data_end;
+
+        Ok(Some(PcapPacketRecord {
+            offset,
+            header,
+            data: &self.data[data_start..data_end],
+        }))
+    }
+
+    /// Read the next packet record, borrowing directly from the input slice.
+    ///
+    /// Unlike the [`CaptureReader`] implementation, records returned by this
+    /// inherent method are tied to the input slice's lifetime `'a` rather than
+    /// to the borrow of the reader, so they may be held across later reads.
+    pub fn next_packet(&mut self) -> Result<Option<PacketRecord<'a>>, CaptureError> {
+        match self.read_packet_raw()? {
+            Some(PcapPacketRecord { header, data, .. }) => Ok(Some(header.to_packet(
+                data,
+                self.header.is_nanosecond(),
+                self.header.link_type(),
+            ))),
+            None => Ok(None),
+        }
+    }
+
+    /// Read the next packet record along with the offset and raw bytes of its
+    /// source record.
+    pub fn next_packet_with_offset(
+        &mut self,
+    ) -> Result<Option<LocatedPacketRecord<'a>>, CaptureError> {
+        match self.read_packet_raw()? {
+            Some(PcapPacketRecord {
+                offset,
+                header,
+                data,
+            }) => Ok(Some(LocatedPacketRecord {
+                offset,
+                raw: &self.data[offset..offset + PcapPacketHeader::LEN + data.len()],
+                packet: header.to_packet(
+                    data,
+                    self.header.is_nanosecond(),
+                    self.header.link_type(),
+                ),
+            })),
+            None => Ok(None),
+        }
+    }
+}
+
+impl<'a> CaptureReader for PcapSliceReader<'a> {
+    fn interfaces(&self) -> Vec<Interface> {
+        vec![self.header.to_interface()]
+    }
+
+    fn next_packet(&mut self) -> Result<Option<PacketRecord<'_>>, CaptureError> {
+        PcapSliceReader::next_packet(self)
     }
 }
 
@@ -485,5 +639,143 @@ mod tests {
                 1, 2, 3, 4,
             ]
         );
+    }
+
+    #[test]
+    fn pcap_slice_reader() {
+        use std::borrow::Cow;
+
+        // Build a little-endian, microsecond capture in memory.
+        let mut buffer = Vec::new();
+        {
+            let mut writer = PcapWriter::new(
+                &mut buffer,
+                false, // big_endian
+                false, // nanosecond
+                65535, // snap_len
+                LinkType::Ethernet,
+            )
+            .unwrap();
+
+            writer
+                .write_packet_raw(
+                    PcapPacketHeader {
+                        ts_sec: 1,
+                        ts_usec: 500,
+                        incl_len: 4,
+                        orig_len: 4,
+                    },
+                    [1, 2, 3, 4],
+                )
+                .unwrap();
+            writer
+                .write_packet_raw(
+                    PcapPacketHeader {
+                        ts_sec: 2,
+                        ts_usec: 250_000,
+                        incl_len: 2,
+                        orig_len: 4,
+                    },
+                    [5, 6],
+                )
+                .unwrap();
+        }
+
+        let mut reader = PcapSliceReader::new(&buffer).unwrap();
+        assert_eq!(reader.header.link_type(), LinkType::Ethernet);
+        assert_eq!(reader.position(), PcapHeader::LEN);
+
+        // Records borrow from the input slice and can be held across reads.
+        let first = reader.next_packet_with_offset().unwrap().unwrap();
+        let second = reader.next_packet_with_offset().unwrap().unwrap();
+
+        assert!(matches!(first.packet.data, Cow::Borrowed(_)));
+        assert_eq!(first.offset, PcapHeader::LEN);
+        assert_eq!(first.raw.len(), PcapPacketHeader::LEN + 4);
+        assert_eq!(
+            first.raw,
+            &buffer[first.offset..first.offset + first.raw.len()]
+        );
+        assert_eq!(second.offset, PcapHeader::LEN + PcapPacketHeader::LEN + 4);
+        assert_eq!(first.packet.timestamp, 1_000_000_000 + 500_000);
+        assert_eq!(&first.packet.data[..], [1, 2, 3, 4].as_slice());
+        assert_eq!(second.packet.timestamp, 2_000_000_000 + 250_000_000);
+        assert_eq!(&second.packet.data[..], [5, 6].as_slice());
+        assert!(second.packet.is_truncated());
+        assert!(reader.next_packet().unwrap().is_none());
+
+        // Generic code can still use the CaptureReader trait.
+        let mut reader = PcapSliceReader::new(&buffer).unwrap();
+        assert_eq!(CaptureReader::interfaces(&reader).len(), 1);
+        assert!(CaptureReader::next_packet(&mut reader).unwrap().is_some());
+
+        // Truncated captures are reported as errors.
+        let mut reader = PcapSliceReader::new(&buffer[..buffer.len() - 1]).unwrap();
+        reader.next_packet().unwrap();
+        assert!(reader.next_packet().is_err());
+    }
+
+    /// A nanosecond-precision capture holding two packets.
+    fn two_packet_capture() -> Vec<u8> {
+        let mut buffer = Vec::new();
+        {
+            let mut writer =
+                PcapWriter::new(&mut buffer, false, true, 65535, LinkType::Ethernet).unwrap();
+            writer
+                .write_packet_raw(
+                    PcapPacketHeader {
+                        ts_sec: 1,
+                        ts_usec: 500,
+                        incl_len: 4,
+                        orig_len: 4,
+                    },
+                    [1, 2, 3, 4],
+                )
+                .unwrap();
+            writer
+                .write_packet_raw(
+                    PcapPacketHeader {
+                        ts_sec: 2,
+                        ts_usec: 250_000_000,
+                        incl_len: 2,
+                        orig_len: 4,
+                    },
+                    [5, 6],
+                )
+                .unwrap();
+        }
+        buffer
+    }
+
+    #[test]
+    fn pcap_slice_reader_matches_streaming_reader() {
+        let buffer = two_packet_capture();
+
+        let mut streaming = PcapReader::new(buffer.as_slice()).unwrap();
+        let mut streamed = Vec::new();
+        while let Some(record) = streaming.next_packet().unwrap() {
+            streamed.push(record.to_owned());
+        }
+
+        let mut slice = PcapSliceReader::new(&buffer).unwrap();
+        let mut sliced = Vec::new();
+        while let Some(record) = slice.next_packet().unwrap() {
+            sliced.push(record);
+        }
+
+        assert_eq!(streamed, sliced);
+    }
+
+    #[test]
+    fn pcap_slice_reader_survives_truncation() {
+        let buffer = two_packet_capture();
+
+        // Every prefix must yield either clean results or an error, never a
+        // panic.
+        for len in 0..=buffer.len() {
+            if let Ok(mut reader) = PcapSliceReader::new(&buffer[..len]) {
+                while let Ok(Some(_)) = reader.next_packet() {}
+            }
+        }
     }
 }
