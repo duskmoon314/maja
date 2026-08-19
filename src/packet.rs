@@ -890,8 +890,8 @@ mod tests {
     #[test]
     fn max_depth_can_stop_after_transport_layer() {
         let data = [
-            01, 02, 03, 04, 05, 06, // Destination MAC
-            11, 12, 13, 14, 15, 16, // Source MAC
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // Destination MAC
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, // Source MAC
             0x08, 0x00, // EtherType: IPv4
             0x45, // Version + IHL
             0x00, // DSCP + ECN
@@ -1033,8 +1033,8 @@ mod tests {
     #[test]
     fn max_depth_zero_parses_no_layers() {
         let data = [
-            01, 02, 03, 04, 05, 06, // Destination MAC
-            11, 12, 13, 14, 15, 16, // Source MAC
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, // Destination MAC
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, // Source MAC
             0x08, 0x00, // EtherType: IPv4
         ];
 
