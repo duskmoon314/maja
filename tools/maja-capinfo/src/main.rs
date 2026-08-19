@@ -35,6 +35,7 @@ struct Cli {
     flags: Flags,
 
     /// Input capture files
+    #[arg(help_heading = None)]
     inputs: Vec<PathBuf>,
 }
 
