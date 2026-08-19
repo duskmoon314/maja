@@ -1,6 +1,6 @@
 [package]
 name = "maja-capinfo"
-version = "0.2.1"
+version = "0.3.0"
 authors.workspace = true
 edition.workspace = true
 repository.workspace = true
@@ -17,12 +17,13 @@ env_logger = { workspace = true }
 indicatif = { workspace = true }
 indicatif-log-bridge = { workspace = true }
 maja = { workspace = true, features = ["serde"] }
-polars = { version = "0.54.4", default-features = false, features = [
+polars = { version = "0.55.2", default-features = false, features = [
     "performant",
     "csv",
     "parquet",
     "dtype-u8",
     "dtype-u16",
+    "dtype-u128",
 ] }
 temporal_rs = { workspace = true }
 human_format = "1.2.1"

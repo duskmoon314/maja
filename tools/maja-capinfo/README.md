@@ -16,23 +16,26 @@ A CLI tool to print information about capture files.
 
 Usage: maja-capinfo [OPTIONS] [INPUTS]...
 
-Arguments:
-  [INPUTS]...  Input capture files
-
 Options:
-  -d, --dump <DUMP>              Whether to dump the inner metadata of all packets in the capture file [possible values: csv, parquet]
-  -o, --output <OUTPUT>          The output directory for generated files. If not specified, the input directory is used
-  -k, --top-k <TOP_K>            The number of top items to display in the statistics [default: 10]
+  -o, --output <OUTPUT>  The output directory for generated files. If not specified, the input directory is used
+  -k, --top-k <TOP_K>    The number of top items to display in the statistics [default: 10]
+      --format <FORMAT>  Report output format [default: text] [possible values: text, json, toml, yaml]
+      --report-file      Write each report to a file instead of stdout
+  -h, --help             Print help (see more with '--help')
+  -V, --version          Print version
+
+Metadata Dump Options:
+  -d, --dump <DUMP_FORMAT>       Whether to dump the inner metadata of all packets in the capture file [possible values: csv, parquet]
+      --numeric-ip               When dumping metadata, whether to append numeric IP address columns
       --batch-size <BATCH_SIZE>  The maximum number of packet metadata rows buffered before a dump batch is written [default: 65536]
-      --format <FORMAT>          Report output format [default: text] [possible values: text, json, toml, yaml]
-      --report-file              Write each report to a file instead of stdout
-      --interval-stats <FORMAT>  Export exact per-interval statistics [possible values: csv, parquet]
-      --interval <DURATION>      Width of exported statistics intervals [default: 1s]
-  -h, --help                     Print help (see more with '--help')
-  -V, --version                  Print version
+
+Per-Interval Stats Dump Options:
+      --interval-format <FORMAT>   Whether to export exact per-interval statistics [possible values: csv, parquet]
+      --interval-width <DURATION>  Width of exported statistics intervals (e.g. 1s, 10s) [default: 1s]
+  [INPUTS]...                      Input capture files
 ```
 
-## Structured reports
+### Structured reports
 
 Write JSON to stdout:
 
@@ -53,27 +56,9 @@ inputs, JSON uses one compact object per line, YAML uses a document stream, and
 TOML uses a `[[reports]]` array of tables. A single TOML report is a standalone
 document.
 
-## Interval statistics
+### Metadata dump
 
-Export exact statistics for each nonempty time interval to a separate file:
-
-```bash
-maja-capinfo --interval-stats csv capture.pcap
-# capture.intervals.csv
-
-maja-capinfo --interval-stats parquet --interval 500ms capture.pcap
-# capture.intervals.parquet
-```
-
-The interval defaults to one second and accepts time suffixes such as `ns`,
-`ms`, `s`, `m`, and `h`. Intervals are aligned to Unix epoch boundaries and
-written chronologically, including for captures with unordered packet
-timestamps. Each row reports packet and L2 byte totals, pps, Bps, unique source
-and destination IP values, and unique symmetric flows. TCP and UDP flows use
-5-tuples; other IP protocols use 3-tuples of addresses and protocol. Empty
-intervals are omitted. `--output` controls the artifact directory.
-
-Use Wireshark's [vlan.cap](https://wiki.wireshark.org/uploads/__moin_import__/attachments/SampleCaptures/vlan.cap.gz) as an example:
+`maja-capinfo` also can export per-packet metadata to CSV or Parquet. Use Wireshark's [vlan.cap](https://wiki.wireshark.org/uploads/__moin_import__/attachments/SampleCaptures/vlan.cap.gz) as an example:
 
 ```bash
 $ maja-capinfo -d csv vlan.cap
@@ -162,3 +147,23 @@ timestamp,length,eth_type,src_ip,dst_ip,ip_proto,tos,ttl,total_length,src_port,d
 941826040065888000,638,33024,131.151.32.21,131.151.32.129,6,0,64,620,6000,1162,24,31576,8,0,0
 941826040066028000,70,33024,131.151.32.129,131.151.32.21,6,0,64,52,1162,6000,16,27472,8,0,0
 ```
+
+### Interval statistics
+
+Export exact statistics for each nonempty time interval to a separate file:
+
+```bash
+maja-capinfo --interval-stats csv capture.pcap
+# capture.intervals.csv
+
+maja-capinfo --interval-stats parquet --interval 500ms capture.pcap
+# capture.intervals.parquet
+```
+
+The interval defaults to one second and accepts time suffixes such as `ns`,
+`ms`, `s`, `m`, and `h`. Intervals are aligned to Unix epoch boundaries and
+written chronologically, including for captures with unordered packet
+timestamps. Each row reports packet and L2 byte totals, pps, Bps, unique source
+and destination IP values, and unique symmetric flows. TCP and UDP flows use
+5-tuples; other IP protocols use 3-tuples of addresses and protocol. Empty
+intervals are omitted. `--output` controls the artifact directory.

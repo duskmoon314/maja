@@ -60,6 +60,10 @@ struct PacketMetadataBatch {
     eth_type: Vec<u16>,
     src_ip: Vec<Option<String>>,
     dst_ip: Vec<Option<String>>,
+    src_ip4: Vec<Option<u32>>,
+    dst_ip4: Vec<Option<u32>>,
+    src_ip6: Vec<Option<u128>>,
+    dst_ip6: Vec<Option<u128>>,
     ip_proto: Vec<u8>,
     tos: Vec<u8>,
     ttl: Vec<u8>,
@@ -71,16 +75,23 @@ struct PacketMetadataBatch {
     tcp_data_offset: Vec<u8>,
     udp_length: Vec<u16>,
     ipv6_payload_length: Vec<u16>,
+    /// Whether the numeric `*_ip4`/`*_ip6` columns are populated and exported.
+    numeric_ip: bool,
 }
 
 impl PacketMetadataBatch {
-    fn with_capacity(capacity: usize) -> Self {
+    fn with_capacity(capacity: usize, numeric_ip: bool) -> Self {
+        let numeric_capacity = if numeric_ip { capacity } else { 0 };
         Self {
             timestamp: Vec::with_capacity(capacity),
             length: Vec::with_capacity(capacity),
             eth_type: Vec::with_capacity(capacity),
             src_ip: Vec::with_capacity(capacity),
             dst_ip: Vec::with_capacity(capacity),
+            src_ip4: Vec::with_capacity(numeric_capacity),
+            dst_ip4: Vec::with_capacity(numeric_capacity),
+            src_ip6: Vec::with_capacity(numeric_capacity),
+            dst_ip6: Vec::with_capacity(numeric_capacity),
             ip_proto: Vec::with_capacity(capacity),
             tos: Vec::with_capacity(capacity),
             ttl: Vec::with_capacity(capacity),
@@ -92,6 +103,7 @@ impl PacketMetadataBatch {
             tcp_data_offset: Vec::with_capacity(capacity),
             udp_length: Vec::with_capacity(capacity),
             ipv6_payload_length: Vec::with_capacity(capacity),
+            numeric_ip,
         }
     }
 
@@ -107,6 +119,14 @@ impl PacketMetadataBatch {
             .push(metadata.src_ip.map(|address| address.to_string()));
         self.dst_ip
             .push(metadata.dst_ip.map(|address| address.to_string()));
+        if self.numeric_ip {
+            let (src_ip4, src_ip6) = numeric_ip(metadata.src_ip);
+            let (dst_ip4, dst_ip6) = numeric_ip(metadata.dst_ip);
+            self.src_ip4.push(src_ip4);
+            self.dst_ip4.push(dst_ip4);
+            self.src_ip6.push(src_ip6);
+            self.dst_ip6.push(dst_ip6);
+        }
         self.ip_proto.push(metadata.ip_proto.unwrap_or(0));
         self.tos.push(metadata.tos.unwrap_or(0));
         self.ttl.push(metadata.ttl.unwrap_or(0));
@@ -123,7 +143,7 @@ impl PacketMetadataBatch {
     }
 
     fn into_dataframe(self) -> PolarsResult<DataFrame> {
-        df!(
+        let mut dataframe = df!(
             "timestamp" => self.timestamp,
             "length" => self.length,
             "eth_type" => self.eth_type,
@@ -140,7 +160,27 @@ impl PacketMetadataBatch {
             "tcp_data_offset" => self.tcp_data_offset,
             "udp_length" => self.udp_length,
             "ipv6_payload_length" => self.ipv6_payload_length,
-        )
+        )?;
+
+        if self.numeric_ip {
+            dataframe.hstack_mut(&[
+                Column::new("src_ip4".into(), self.src_ip4),
+                Column::new("dst_ip4".into(), self.dst_ip4),
+                Column::new("src_ip6".into(), self.src_ip6),
+                Column::new("dst_ip6".into(), self.dst_ip6),
+            ])?;
+        }
+
+        Ok(dataframe)
+    }
+}
+
+/// Split an IP address into its numeric IPv4 (u32) or IPv6 (u128) form.
+fn numeric_ip(address: Option<IpAddr>) -> (Option<u32>, Option<u128>) {
+    match address {
+        Some(IpAddr::V4(address)) => (Some(u32::from(address)), None),
+        Some(IpAddr::V6(address)) => (None, Some(u128::from(address))),
+        None => (None, None),
     }
 }
 
@@ -189,6 +229,7 @@ impl MetadataDumper {
         output_path: PathBuf,
         format: DumpFormat,
         batch_size: usize,
+        numeric_ip: bool,
     ) -> anyhow::Result<Self> {
         let output_directory = output_directory(&output_path);
         std::fs::create_dir_all(output_directory)?;
@@ -196,7 +237,7 @@ impl MetadataDumper {
         let tempfile = tempfile::NamedTempFile::new_in(output_directory)?;
         let temp_path = tempfile.into_temp_path();
         let file = File::create(&temp_path)?;
-        let schema = PacketMetadataBatch::default()
+        let schema = PacketMetadataBatch::with_capacity(0, numeric_ip)
             .into_dataframe()?
             .schema()
             .clone();
@@ -211,7 +252,7 @@ impl MetadataDumper {
 
         Ok(Self {
             writer,
-            batch: PacketMetadataBatch::with_capacity(batch_size),
+            batch: PacketMetadataBatch::with_capacity(batch_size, numeric_ip),
             batch_size,
             temp_path,
             output_path,
@@ -234,9 +275,10 @@ impl MetadataDumper {
         }
 
         let start = Instant::now();
+        let numeric_ip = self.batch.numeric_ip;
         let batch = std::mem::replace(
             &mut self.batch,
-            PacketMetadataBatch::with_capacity(self.batch_size),
+            PacketMetadataBatch::with_capacity(self.batch_size, numeric_ip),
         );
         let dataframe = batch.into_dataframe()?;
         self.writer.write_batch(&dataframe)?;
@@ -300,7 +342,7 @@ mod tests {
     fn csv_dumper_flushes_multiple_batches() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let output = dir.path().join("packets.csv");
-        let mut dumper = MetadataDumper::new(output.clone(), DumpFormat::Csv, 2)?;
+        let mut dumper = MetadataDumper::new(output.clone(), DumpFormat::Csv, 2, false)?;
         for timestamp in 1..=5 {
             dumper.push(metadata(timestamp))?;
         }
@@ -316,7 +358,7 @@ mod tests {
     fn parquet_dumper_flushes_multiple_batches() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let output = dir.path().join("packets.parquet");
-        let mut dumper = MetadataDumper::new(output.clone(), DumpFormat::Parquet, 2)?;
+        let mut dumper = MetadataDumper::new(output.clone(), DumpFormat::Parquet, 2, false)?;
         for timestamp in 1..=5 {
             dumper.push(metadata(timestamp))?;
         }
@@ -331,7 +373,7 @@ mod tests {
     fn metadata_dump_uses_canonical_ipv6_addresses() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let output = dir.path().join("packets.csv");
-        let mut dumper = MetadataDumper::new(output.clone(), DumpFormat::Csv, 1)?;
+        let mut dumper = MetadataDumper::new(output.clone(), DumpFormat::Csv, 1, false)?;
         dumper.push(PacketMetadata {
             timestamp: 1,
             src_ip: Some("2001:db8::1".parse()?),
@@ -352,13 +394,64 @@ mod tests {
     fn parquet_dump_preserves_missing_ips_as_null() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let output = dir.path().join("packets.parquet");
-        let mut dumper = MetadataDumper::new(output.clone(), DumpFormat::Parquet, 1)?;
+        let mut dumper = MetadataDumper::new(output.clone(), DumpFormat::Parquet, 1, false)?;
         dumper.push(PacketMetadata::default())?;
         dumper.finish()?;
 
         let dataframe = ParquetReader::new(File::open(output)?).finish()?;
         assert_eq!(dataframe.column("src_ip")?.str()?.get(0), None);
         assert_eq!(dataframe.column("dst_ip")?.str()?.get(0), None);
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_ip_dump_appends_numeric_columns() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let output = dir.path().join("packets.csv");
+        let mut dumper = MetadataDumper::new(output.clone(), DumpFormat::Csv, 1, true)?;
+        dumper.push(PacketMetadata {
+            timestamp: 1,
+            src_ip: Some("1.2.3.4".parse()?),
+            dst_ip: Some("2001:db8::1".parse()?),
+            ..Default::default()
+        })?;
+        dumper.finish()?;
+
+        let contents = std::fs::read_to_string(output)?;
+        assert!(contents.contains("src_ip,dst_ip,ip_proto"));
+        assert!(contents.contains("src_ip4,dst_ip4,src_ip6,dst_ip6"));
+        // 1.2.3.4 as u32, then empty dst_ip4 and src_ip6, then 2001:db8::1 as u128
+        assert!(contents.contains(&format!(
+            "{},,,{}",
+            u32::from(std::net::Ipv4Addr::new(1, 2, 3, 4)),
+            u128::from("2001:db8::1".parse::<std::net::Ipv6Addr>()?)
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn numeric_ip_parquet_columns_use_unsigned_dtypes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let output = dir.path().join("packets.parquet");
+        let mut dumper = MetadataDumper::new(output.clone(), DumpFormat::Parquet, 1, true)?;
+        dumper.push(PacketMetadata {
+            src_ip: Some("1.2.3.4".parse()?),
+            dst_ip: Some("::1".parse()?),
+            ..Default::default()
+        })?;
+        dumper.finish()?;
+
+        let dataframe = ParquetReader::new(File::open(output)?).finish()?;
+        assert_eq!(
+            dataframe.column("src_ip4")?.u32()?.get(0),
+            Some(u32::from(std::net::Ipv4Addr::new(1, 2, 3, 4)))
+        );
+        assert_eq!(dataframe.column("src_ip6")?.u128()?.get(0), None);
+        assert_eq!(dataframe.column("dst_ip4")?.u32()?.get(0), None);
+        assert_eq!(
+            dataframe.column("dst_ip6")?.u128()?.get(0),
+            Some(u128::from(std::net::Ipv6Addr::LOCALHOST))
+        );
         Ok(())
     }
 }

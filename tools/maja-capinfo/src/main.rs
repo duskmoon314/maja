@@ -40,10 +40,6 @@ struct Cli {
 /// CLI arguments
 #[derive(Debug, Args)]
 struct Flags {
-    /// Whether to dump the inner metadata of all packets in the capture file
-    #[arg(short, long, value_enum)]
-    dump: Option<DumpFormat>,
-
     /// The output directory for generated files. If not specified, the input directory is used.
     #[arg(short, long)]
     output: Option<PathBuf>,
@@ -51,10 +47,6 @@ struct Flags {
     /// The number of top items to display in the statistics
     #[arg(short = 'k', long, default_value_t = 10)]
     top_k: usize,
-
-    /// The maximum number of packet metadata rows buffered before a dump batch is written
-    #[arg(long, default_value_t = unsafe { NonZeroUsize::new_unchecked(65536) })]
-    batch_size: NonZeroUsize,
 
     /// Report output format
     #[arg(long, value_enum, default_value_t)]
@@ -64,19 +56,49 @@ struct Flags {
     #[arg(long)]
     report_file: bool,
 
-    /// Export exact per-interval statistics
-    #[arg(long, value_enum, value_name = "FORMAT")]
-    interval_stats: Option<DumpFormat>,
+    #[command(flatten)]
+    dump: DumpArgs,
 
-    /// Width of exported statistics intervals
+    #[command(flatten)]
+    interval: IntervalArgs,
+}
+
+#[derive(Debug, Args)]
+#[command(next_help_heading = "Metadata Dump Options")]
+#[group(requires = "dump_format")]
+struct DumpArgs {
+    /// Whether to dump the inner metadata of all packets in the capture file
+    #[arg(short = 'd', long = "dump", value_enum)]
+    dump_format: Option<DumpFormat>,
+
+    /// When dumping metadata, whether to append numeric IP address columns
+    ///
+    /// If set, src_ip4/dst_ip4/src_ip6/dst_ip6 columns will be added to the metadata dump, containing the numeric
+    /// representation of the source and destination IP addresses.
+    #[arg(long)]
+    numeric_ip: bool,
+
+    /// The maximum number of packet metadata rows buffered before a dump batch is written
+    #[arg(long, default_value_t = unsafe { NonZeroUsize::new_unchecked(65536) })]
+    batch_size: NonZeroUsize,
+}
+
+#[derive(Debug, Args)]
+#[command(next_help_heading = "Per-Interval Stats Dump Options")]
+struct IntervalArgs {
+    /// Whether to export exact per-interval statistics
+    #[arg(long, value_enum, value_name = "FORMAT")]
+    interval_format: Option<DumpFormat>,
+
+    /// Width of exported statistics intervals (e.g. 1s, 10s)
     #[arg(
         long,
         value_name = "DURATION",
         value_parser = parse_interval,
         default_value = "1s",
-        requires = "interval_stats"
+        requires = "interval_format"
     )]
-    interval: NonZeroU64,
+    interval_width: NonZeroU64,
 }
 
 fn parse_interval(value: &str) -> Result<NonZeroU64, String> {
@@ -164,11 +186,13 @@ fn analyze(
 
     let mut dumper = args
         .dump
+        .dump_format
         .map(|dump_format| {
             MetadataDumper::new(
                 dump_path(file_path, args.output.as_deref(), dump_format),
                 dump_format,
-                args.batch_size.into(),
+                args.dump.batch_size.into(),
+                args.dump.numeric_ip,
             )
         })
         .transpose()?;
@@ -176,8 +200,9 @@ fn analyze(
     let start = Instant::now();
     let mut stats = Stats::default();
     let mut interval_stats = args
-        .interval_stats
-        .map(|_| IntervalStats::new(args.interval));
+        .interval
+        .interval_format
+        .map(|_| IntervalStats::new(args.interval.interval_width));
 
     loop {
         pg.inc(1);
@@ -228,7 +253,7 @@ fn analyze(
         }
     }
 
-    let interval_export = match (&interval_stats, args.interval_stats) {
+    let interval_export = match (&interval_stats, args.interval.interval_format) {
         (Some(stats), Some(format)) => Some(write_interval_stats(
             stats,
             interval_path(file_path, args.output.as_deref(), format),
@@ -411,14 +436,22 @@ mod tests {
     #[test]
     fn interval_export_is_optional_and_interval_requires_it() {
         let cli = Cli::try_parse_from(["maja-capinfo"]).unwrap();
-        assert_eq!(cli.flags.interval_stats, None);
-        assert_eq!(cli.flags.interval.get(), 1_000_000_000);
+        assert_eq!(cli.flags.interval.interval_format, None);
+        assert_eq!(cli.flags.interval.interval_width.get(), 1_000_000_000);
 
-        let cli = Cli::try_parse_from(["maja-capinfo", "--interval-stats", "csv"]).unwrap();
-        assert_eq!(cli.flags.interval_stats, Some(DumpFormat::Csv));
-        assert_eq!(cli.flags.interval.get(), 1_000_000_000);
+        let cli = Cli::try_parse_from(["maja-capinfo", "--interval-format", "csv"]).unwrap();
+        assert_eq!(cli.flags.interval.interval_format, Some(DumpFormat::Csv));
+        assert_eq!(cli.flags.interval.interval_width.get(), 1_000_000_000);
 
-        assert!(Cli::try_parse_from(["maja-capinfo", "--interval", "500ms"]).is_err());
+        assert!(Cli::try_parse_from(["maja-capinfo", "--interval-width", "500ms"]).is_err());
+    }
+
+    #[test]
+    fn numeric_ip_requires_dump() {
+        assert!(Cli::try_parse_from(["maja-capinfo", "--numeric-ip"]).is_err());
+
+        let cli = Cli::try_parse_from(["maja-capinfo", "--dump", "csv", "--numeric-ip"]).unwrap();
+        assert!(cli.flags.dump.numeric_ip);
     }
 
     #[test]
