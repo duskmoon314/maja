@@ -105,7 +105,7 @@ fn merge_impl(
     multi: &indicatif::MultiProgress,
 ) -> anyhow::Result<()> {
     let batch_size = merge_args.batch_size.unwrap_or(128);
-    if input_files.len() < batch_size {
+    if input_files.len() <= batch_size {
         // Merge all input files into the output file
 
         let pg_style = ProgressStyle::with_template(
@@ -181,6 +181,14 @@ fn merge_impl(
         pcap_writer.flush()?;
         write_pg.finish_with_message("Done");
     } else {
+        // Batching only helps if each round strictly reduces the number of
+        // files to merge; batch_size 1 would recurse forever.
+        if batch_size < 2 {
+            return Err(anyhow!(
+                "batch size must be at least 2 when merging more files than the batch size"
+            ));
+        }
+
         let tmp_dir = tempfile::tempdir()?;
 
         let batches = input_files.chunks(batch_size);
