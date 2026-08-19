@@ -66,6 +66,9 @@ $ maja-capinfo -d csv vlan.cap
 File:               vlan.cap
   Format:           Pcap
   Size:             144.46 kB
+  MD5:              30083ee24b65eb26297dd954c4928c91
+  SHA1:             eb4744adc48eaec5b573b9207841c2a397d7ad0e
+  SHA256:           283070d3784bbbe91fde8d0b6618e55549483afb42ebaf25ecb2d1c7c4ebf1ad
   Processing Time:  0.014774 s
   Interfaces:
     #0              LinkType = Ethernet, SnapLen = 65535, Resolution = 10^-6s (microseconds)

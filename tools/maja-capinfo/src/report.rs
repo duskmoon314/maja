@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::{
     analysis::{RunningTrafficStats, Stats},
+    hash::FileHashes,
     metadata::{DumpFormat, DumpResult},
 };
 
@@ -68,6 +69,9 @@ pub struct FileReport {
 
     /// Size of the capture file in bytes
     pub size_bytes: u64,
+
+    /// Digests of the capture file
+    pub hashes: FileHashes,
 
     /// Time taken to process the capture file in seconds
     pub processing_time_seconds: f64,
@@ -253,6 +257,9 @@ impl CaptureReport {
             "  Size:             {}B",
             humanize.format(self.file.size_bytes as f64)
         )?;
+        writeln!(writer, "  MD5:              {}", self.file.hashes.md5)?;
+        writeln!(writer, "  SHA1:             {}", self.file.hashes.sha1)?;
+        writeln!(writer, "  SHA256:           {}", self.file.hashes.sha256)?;
         writeln!(
             writer,
             "  Processing Time:  {:.6} s",
@@ -433,6 +440,7 @@ impl FileReport {
         file_path: &Path,
         capture_format: CaptureFormat,
         file_size: u64,
+        hashes: FileHashes,
         processing_time: Duration,
         interfaces: &[Interface],
     ) -> Self {
@@ -440,6 +448,7 @@ impl FileReport {
             path: file_path.display().to_string(),
             capture_format,
             size_bytes: file_size,
+            hashes,
             processing_time_seconds: processing_time.as_secs_f64(),
             interfaces: interfaces.to_vec(),
         }
@@ -556,6 +565,14 @@ mod tests {
     use super::*;
     use maja::capture::{interface::Resolution, link_type::LinkType};
 
+    fn sample_hashes() -> FileHashes {
+        FileHashes {
+            md5: "d41d8cd98f00b204e9800998ecf8427e".to_string(),
+            sha1: "da39a3ee5e6b4b0d3255bfef95601890afd80709".to_string(),
+            sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+        }
+    }
+
     fn sample_report(path: &str) -> CaptureReport {
         let mut stats = Stats::default();
         stats.update_with_packet(1_000_000_000, 64);
@@ -566,6 +583,7 @@ mod tests {
                 Path::new(path),
                 CaptureFormat::Pcap,
                 256,
+                sample_hashes(),
                 Duration::from_millis(5),
                 &[Interface {
                     link_type: LinkType::Ethernet,
@@ -596,6 +614,10 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(json_reports.len(), 2);
         assert_eq!(json_reports[0]["file"]["capture_format"], "Pcap");
+        assert_eq!(
+            json_reports[0]["file"]["hashes"]["sha256"],
+            sample_hashes().sha256
+        );
         assert_eq!(
             json_reports[0]["file"]["interfaces"][0],
             serde_json::json!({
@@ -645,6 +667,7 @@ mod tests {
                 Path::new("empty.pcap"),
                 CaptureFormat::Pcap,
                 24,
+                sample_hashes(),
                 Duration::ZERO,
                 &[],
             ),

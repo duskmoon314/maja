@@ -208,6 +208,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "base16ct"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd307490d624467aa6f74b0eabb77633d1f758a7b25f12bceb0b22e08d9726f6"
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1558,9 +1564,10 @@ dependencies = [
 
 [[package]]
 name = "maja-capinfo"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
+ "base16ct",
  "clap",
  "env_logger",
  "human_format",
@@ -1569,9 +1576,12 @@ dependencies = [
  "itertools 0.15.0",
  "log",
  "maja",
+ "md-5",
  "polars",
  "serde",
  "serde_json",
+ "sha1",
+ "sha2",
  "tempfile",
  "temporal_rs",
  "toml",
@@ -1632,6 +1642,16 @@ dependencies = [
  "indicatif-log-bridge",
  "log",
  "maja",
+]
+
+[[package]]
+name = "md-5"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69b6441f590336821bb897fb28fc622898ccceb1d6cea3fde5ea86b090c4de98"
+dependencies = [
+ "cfg-if",
+ "digest",
 ]
 
 [[package]]
@@ -3073,6 +3093,17 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]

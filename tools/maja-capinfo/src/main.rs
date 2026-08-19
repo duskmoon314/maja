@@ -15,6 +15,7 @@ use maja::{
 };
 
 mod analysis;
+mod hash;
 mod interval;
 mod metadata;
 mod report;
@@ -172,7 +173,8 @@ fn analyze(
     let file = File::open(file_path)?;
     let file_size = file.metadata()?.len();
 
-    let mut reader = maja::capture::SniffedReader::new(file)?;
+    let (hashing_reader, hash_handle) = hash::HashingReader::new(file);
+    let mut reader = maja::capture::SniffedReader::new(hashing_reader)?;
     let format = reader.format();
     debug!("CaptureFileReader {:?}", reader);
 
@@ -283,6 +285,7 @@ fn analyze(
             file_path,
             format,
             file_size,
+            hash_handle.finish(),
             processing_time,
             &reader.interfaces(),
         ),
