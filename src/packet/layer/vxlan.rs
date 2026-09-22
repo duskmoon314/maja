@@ -290,6 +290,44 @@ mod tests {
             "10:11:12:13:14:15"
         );
         assert!(packet.nth_layer(Eth, 2).is_none());
+
+        // Negative indexes count the matching layers from the outermost one
+        // inwards, so -1 is the outer header and -2 the inner one.
+        assert_eq!(
+            packet
+                .nth_layer_viewer(Eth, -1)
+                .expect("outermost eth")
+                .src()
+                .get()
+                .to_string(),
+            "10:11:12:13:14:15"
+        );
+        assert_eq!(
+            packet
+                .nth_layer_viewer(Eth, -2)
+                .expect("innermost eth")
+                .src()
+                .get()
+                .to_string(),
+            "02:00:00:00:00:01"
+        );
+        assert_eq!(
+            packet
+                .nth_layer_viewer(Ipv4, -1)
+                .expect("outermost IPv4")
+                .src()
+                .get(),
+            core::net::Ipv4Addr::new(192, 0, 2, 1)
+        );
+        assert_eq!(
+            packet
+                .nth_layer_viewer(Ipv4, -2)
+                .expect("innermost IPv4")
+                .src()
+                .get(),
+            core::net::Ipv4Addr::new(10, 0, 0, 1)
+        );
+        assert!(packet.nth_layer(Eth, -3).is_none());
         assert_eq!(packet.layer(Ipv4).expect("latest IPv4").offset, 64);
         assert_eq!(
             packet

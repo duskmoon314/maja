@@ -183,25 +183,42 @@ where
     /// Return metadata for the latest layer that matches the given protocol.
     ///
     /// This returns the parsed layer entry, including protocol marker, byte
-    /// offset, and length. Use [`layer_viewer`](Packet::layer_viewer) when you want a typed
-    /// protocol viewer over the layer bytes.
+    /// offset, and length. Use [`layer_viewer`](Packet::layer_viewer) when you
+    /// want a typed protocol viewer over the layer bytes.
+    ///
+    /// "Latest" means the innermost layer of a tunneled packet. When multiple
+    /// layers of the same protocol are present, use [`nth_layer`](Packet::nth_layer) to select a specific one.
     pub fn layer<P: Protocol>(&self, protocol: P) -> Option<&Layer> {
         self.nth_layer(protocol, 0)
     }
 
-    /// Return metadata for the nth latest layer that matches the protocol.
+    /// Return metadata for the nth layer that matches the protocol.
     ///
-    /// Index `0` is the same layer returned by [`layer`](Packet::layer). Larger
-    /// indexes walk outward through earlier matching layers, so in a tunneled
-    /// packet `nth_layer(Eth, 0)` returns the innermost Ethernet layer and
-    /// `nth_layer(Eth, 1)` returns the next outer Ethernet layer.
-    pub fn nth_layer<P: Protocol>(&self, protocol: P, index: usize) -> Option<&Layer> {
+    /// The index counts from the innermost to the outermost matching layer.
+    /// Take a tunneled packet as an example:
+    ///
+    /// ```text
+    /// Packet: Eth / IPv6(outer) / Ipv6Route / IPv6(inner) / Tcp
+    ///
+    /// nth_layer(Ipv6, 0) = IPv6(inner)
+    /// nth_layer(Ipv6, 1) = IPv6(outer)
+    /// nth_layer(Ipv6, -1) = IPv6(outer)
+    /// nth_layer(Ipv6, -2) = IPv6(inner)
+    /// ```
+    ///
+    /// [`layer`](Packet::layer) is equivalent to `nth_layer(protocol, 0)`.
+    pub fn nth_layer<P: Protocol>(&self, protocol: P, index: isize) -> Option<&Layer> {
         let protocol_id = protocol.id();
-        self.layers
+        let mut matching = self
+            .layers
             .iter()
-            .rev()
-            .filter(|layer| layer.protocol.id() == protocol_id)
-            .nth(index)
+            .filter(|layer| layer.protocol.id() == protocol_id);
+
+        if index >= 0 {
+            matching.rev().nth(index as usize)
+        } else {
+            matching.nth(index.unsigned_abs() - 1)
+        }
     }
 
     /// Return the byte range for the latest matching layer.
@@ -209,8 +226,11 @@ where
         self.nth_layer_range(protocol, 0)
     }
 
-    /// Return the byte range for the nth latest matching layer.
-    pub fn nth_layer_range<P: Protocol>(&self, protocol: P, index: usize) -> Option<Range<usize>> {
+    /// Return the byte range for the nth matching layer.
+    ///
+    /// The index counts from the innermost to the outermost matching layer.
+    /// See [`nth_layer`](Packet::nth_layer) for the index convention.
+    pub fn nth_layer_range<P: Protocol>(&self, protocol: P, index: isize) -> Option<Range<usize>> {
         self.nth_layer(protocol, index).map(Layer::range)
     }
 
@@ -219,8 +239,11 @@ where
         self.nth_layer_bytes(protocol, 0)
     }
 
-    /// Return the bytes for the nth latest matching layer.
-    pub fn nth_layer_bytes<P: Protocol>(&self, protocol: P, index: usize) -> Option<&[u8]> {
+    /// Return the bytes for the nth matching layer.
+    ///
+    /// The index counts from the innermost to the outermost matching layer.
+    /// See [`nth_layer`](Packet::nth_layer) for the index convention.
+    pub fn nth_layer_bytes<P: Protocol>(&self, protocol: P, index: isize) -> Option<&[u8]> {
         self.nth_layer(protocol, index)
             .map(|layer| layer.bytes(self.bytes.as_ref()))
     }
@@ -230,11 +253,14 @@ where
         self.nth_layer_viewer(protocol, 0)
     }
 
-    /// Return a typed viewer for the nth latest matching layer.
+    /// Return a typed viewer for the nth matching layer.
+    ///
+    /// The index counts from the innermost to the outermost matching layer.
+    /// See [`nth_layer`](Packet::nth_layer) for the index convention.
     pub fn nth_layer_viewer<P: ProtocolExt>(
         &self,
         protocol: P,
-        index: usize,
+        index: isize,
     ) -> Option<P::Viewer<'_>> {
         self.nth_layer(protocol, index)
             .map(|layer| P::view(layer.bytes(self.bytes.as_ref())))
@@ -272,11 +298,14 @@ where
         self.nth_layer_bytes_mut(protocol, 0)
     }
 
-    /// Return mutable bytes for the nth latest matching layer.
+    /// Return mutable bytes for the nth matching layer.
+    ///
+    /// The index counts from the innermost to the outermost matching layer.
+    /// See [`nth_layer`](Packet::nth_layer) for the index convention.
     pub fn nth_layer_bytes_mut<P: Protocol>(
         &mut self,
         protocol: P,
-        index: usize,
+        index: isize,
     ) -> Option<&mut [u8]> {
         let range = self.nth_layer(protocol, index)?.range();
         Some(&mut self.bytes.as_mut()[range])
@@ -287,11 +316,14 @@ where
         self.nth_layer_viewer_mut(protocol, 0)
     }
 
-    /// Return a mutable typed viewer for the nth latest matching layer.
+    /// Return a mutable typed viewer for the nth matching layer.
+    ///
+    /// The index counts from the innermost to the outermost matching layer.
+    /// See [`nth_layer`](Packet::nth_layer) for the index convention.
     pub fn nth_layer_viewer_mut<P: ProtocolExt>(
         &mut self,
         protocol: P,
-        index: usize,
+        index: isize,
     ) -> Option<P::ViewerMut<'_>> {
         self.nth_layer_bytes_mut(protocol, index).map(P::view_mut)
     }
