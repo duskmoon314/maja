@@ -414,6 +414,9 @@ impl<T: AsRef<[u8]>, F: FieldSpec, const MSB: bool> FieldAccessor<T, F, MSB> {
 impl<T: AsRef<[u8]> + AsMut<[u8]>, F: FieldSpec, const MSB: bool> FieldAccessor<T, F, MSB> {
     /// Set the value of the field.
     ///
+    /// The value is masked into the field, so bits that do not fit are dropped
+    /// instead of leaking into the neighboring fields.
+    ///
     /// This method is only available when the underlying storage is mutable.
     #[inline]
     pub fn set(&mut self, value: F::T) {
@@ -431,11 +434,13 @@ impl<T: AsRef<[u8]> + AsMut<[u8]>, F: FieldSpec, const MSB: bool> FieldAccessor<
         let new_value = if F::MASK == u64::MAX && F::SHIFT == 0 {
             value.into_underlay()
         } else if F::SHIFT == 0 {
-            prev_value.mask(!F::MASK).bitor(value.into_underlay())
+            prev_value
+                .mask(!F::MASK)
+                .bitor(value.into_underlay().mask(F::MASK))
         } else {
             prev_value
                 .mask(!F::MASK)
-                .bitor(value.into_underlay().shl(F::SHIFT))
+                .bitor(value.into_underlay().shl(F::SHIFT).mask(F::MASK))
         };
 
         // Apply endianness conversion
