@@ -76,7 +76,7 @@ impl ProtocolExt for Icmp {
     ) -> Result<(), crate::packet::error::ParseError> {
         ctx.require(&Icmp, offset, Icmp::MIN_LEN)?;
 
-        let len = ctx.bytes.len() - offset;
+        let len = ctx.rest(offset).len();
         ctx.push_layer(&Icmp, offset, len);
 
         Ok(())

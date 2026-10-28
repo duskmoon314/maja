@@ -405,6 +405,13 @@ impl Default for ParseOptions {
 pub struct ParseContext<'a> {
     /// Full packet bytes being parsed.
     pub bytes: &'a [u8],
+    /// End of the region the current subtree may use, as declared by an
+    /// enclosing header. `None` when no enclosing header states a length, so
+    /// only the captured bytes bound the subtree.
+    ///
+    /// A parser that bounds its children (IPv6 with its payload length) sets the
+    /// field before dispatching them and restores the previous value afterwards.
+    pub declared_end: Option<usize>,
     /// Parse options selected by the caller.
     pub options: ParseOptions,
     /// Layer metadata accumulated so far.
@@ -416,9 +423,28 @@ impl<'a> ParseContext<'a> {
     pub fn new(bytes: &'a [u8], options: ParseOptions, layers: Vec<Layer>) -> Self {
         Self {
             bytes,
+            declared_end: None,
             options,
             layers,
         }
+    }
+
+    /// End of the region this subtree may use: the declared end, clamped to the
+    /// captured bytes.
+    fn end(&self) -> usize {
+        self.declared_end
+            .unwrap_or(self.bytes.len())
+            .min(self.bytes.len())
+    }
+
+    /// Bytes from `offset` to the end of the current region.
+    ///
+    /// This is the captured remainder for an unbounded subtree and the declared
+    /// remainder behind an enclosing header otherwise; an `offset` at or behind
+    /// the end yields an empty slice.
+    pub fn rest(&self, offset: usize) -> &'a [u8] {
+        let start = offset.min(self.end());
+        &self.bytes[start..self.end()]
     }
 
     /// Parse a protocol at `offset` if structured parsing is still allowed.
@@ -479,7 +505,7 @@ impl<'a> ParseContext<'a> {
     /// decoding the next structured protocol layer. It is intentionally allowed
     /// beyond `max_depth` so the unparsed remainder is still visible.
     pub fn parse_raw(&mut self, offset: usize) {
-        if let Some(len) = self.bytes.len().checked_sub(offset)
+        if let Some(len) = self.end().checked_sub(offset)
             && len > 0
         {
             // If the last layer is already a Raw layer with the same offset and length, do not add another Raw layer.
@@ -502,7 +528,7 @@ impl<'a> ParseContext<'a> {
     /// Require a byte range for a protocol header or body.
     ///
     /// Returns [`Truncated`](ParseError::Truncated) when `offset..offset + len` is not
-    /// fully present in the packet.
+    /// fully present in the current region.
     pub fn require(
         &self,
         protocol: &'static dyn Protocol,
@@ -511,11 +537,15 @@ impl<'a> ParseContext<'a> {
     ) -> Result<&'a [u8], ParseError> {
         let end = offset
             .checked_add(len)
-            .ok_or_else(|| ParseError::truncated(protocol, offset, len, self.bytes.len()))?;
+            .ok_or_else(|| ParseError::truncated(protocol, offset, len, self.end()))?;
+
+        if end > self.end() {
+            return Err(ParseError::truncated(protocol, offset, len, self.end()));
+        }
 
         self.bytes
             .get(offset..end)
-            .ok_or_else(|| ParseError::truncated(protocol, offset, len, self.bytes.len()))
+            .ok_or_else(|| ParseError::truncated(protocol, offset, len, self.end()))
     }
 
     fn can_push_layer(&self) -> bool {

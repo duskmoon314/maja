@@ -74,7 +74,7 @@ impl ProtocolExt for Sctp {
     ) -> Result<(), crate::packet::error::ParseError> {
         ctx.require(&Sctp, offset, Sctp::MIN_LEN)?;
 
-        ctx.push_layer(&Sctp, offset, ctx.bytes.len() - offset);
+        ctx.push_layer(&Sctp, offset, ctx.rest(offset).len());
 
         Ok(())
     }

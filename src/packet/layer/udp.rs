@@ -17,14 +17,17 @@
 //! ~                              ...                              ~
 //! ```
 
-use std::{fmt::Debug, net::Ipv4Addr};
+use std::{
+    fmt::Debug,
+    net::{Ipv4Addr, Ipv6Addr},
+};
 
 use crate::{
     field_spec,
     packet::{
         layer::{Protocol, ProtocolExt},
         utils::{
-            checksum::ipv4_transport_checksum_zeroing,
+            checksum::{ipv4_transport_checksum_zeroing, ipv6_transport_checksum_zeroing},
             field::{FieldMut, FieldRef},
         },
     },
@@ -210,6 +213,39 @@ where
         checksum == 0 || checksum == self.calculate_checksum_ipv4(src, dst)
     }
 
+    /// Calculate the UDP checksum using an IPv6 pseudo header.
+    ///
+    /// The IPv6 header stores no length for the transport, so the byte slice                           
+    /// passed to [`new`](UdpViewer::new) supplies the upper layer packet length of                     
+    /// the pseudo header, and the UDP length field bounds how many of those bytes                      
+    /// are checksummed.
+    ///
+    /// The checksum is mandatory on IPv6; if the calculated value is zero it is
+    /// transmitted as `0xffff`.
+    #[inline]
+    pub fn calculate_checksum_ipv6(&self, src: Ipv6Addr, dst: Ipv6Addr) -> u16 {
+        let data = self.data.as_ref();
+        let datagram_len = usize::from(self.length().get()).min(data.len());
+        let checksum = ipv6_transport_checksum_zeroing(
+            src,
+            dst,
+            17,
+            &data[..datagram_len],
+            Self::FIELD_CHECKSUM,
+        );
+        if checksum == 0 { 0xffff } else { checksum }
+    }
+
+    /// Return whether the UDP checksum is valid for the given IPv6 endpoints.
+    ///
+    /// The checksum is mandatory on IPv6, so a stored zero is *not* treated as
+    /// a disabled checksum here (unlike
+    /// [`validate_checksum_ipv4`](UdpViewer::validate_checksum_ipv4)).
+    #[inline]
+    pub fn validate_checksum_ipv6(&self, src: Ipv6Addr, dst: Ipv6Addr) -> bool {
+        self.checksum().get() == self.calculate_checksum_ipv6(src, dst)
+    }
+
     /// Get the accessor of the source port.
     #[inline]
     pub fn src_port(&self) -> FieldRef<'_, PortSpec> {
@@ -347,5 +383,34 @@ mod tests {
 
         data[9] = b'o';
         assert!(!UdpViewer::new(&data).validate_checksum_ipv4(src, dst));
+    }
+
+    #[test]
+    fn udp_checksum_helpers_ipv6() {
+        let src = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let dst = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+        let mut data = [
+            0x30, 0x39, // src port
+            0x00, 0x35, // dst port
+            0x00, 0x0a, // length
+            0x00, 0x00, // checksum
+            b'h', b'i',
+        ];
+
+        {
+            let mut udp = UdpViewer::new(&mut data);
+            let checksum = udp.calculate_checksum_ipv6(src, dst);
+            udp.checksum_mut().set(checksum);
+        }
+
+        assert!(UdpViewer::new(&data).validate_checksum_ipv6(src, dst));
+        // IPv6 has no "checksum disabled" state, so a stored zero is invalid.
+        assert!(
+            !UdpViewer::new(&[0x30, 0x39, 0x00, 0x35, 0x00, 0x0a, 0x00, 0x00])
+                .validate_checksum_ipv6(src, dst)
+        );
+
+        data[9] = b'o';
+        assert!(!UdpViewer::new(&data).validate_checksum_ipv6(src, dst));
     }
 }

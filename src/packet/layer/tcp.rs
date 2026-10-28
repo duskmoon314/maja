@@ -26,14 +26,14 @@
 //! ~                              ...                              ~
 //! ```
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::{
     field_spec,
     packet::{
         layer::{Protocol, ProtocolExt},
         utils::{
-            checksum::ipv4_transport_checksum_zeroing,
+            checksum::{ipv4_transport_checksum_zeroing, ipv6_transport_checksum_zeroing},
             field::{FieldMut, FieldRef},
         },
     },
@@ -133,7 +133,7 @@ impl ProtocolExt for Tcp {
         let src_port = tcp.src_port().get();
         let dst_port = tcp.dst_port().get();
         let payload_offset = offset + header_len;
-        let payload = ctx.bytes.get(payload_offset..).unwrap_or_default();
+        let payload = ctx.rest(payload_offset);
 
         match (src_port, dst_port) {
             (src, dst)
@@ -284,6 +284,27 @@ where
     #[inline]
     pub fn validate_checksum_ipv4(&self, src: Ipv4Addr, dst: Ipv4Addr) -> bool {
         self.checksum().get() == self.calculate_checksum_ipv4(src, dst)
+    }
+
+    /// Calculate the TCP checksum using an IPv6 pseudo header.
+    ///
+    /// The checksum field is treated as zero during calculation. The viewer
+    /// must contain the complete TCP segment, including payload bytes; TCP has
+    /// no length field of its own, so this helper uses the full byte slice
+    /// passed to [`new`](TcpViewer::new), and that length becomes the upper
+    /// layer packet length of the pseudo header.
+    #[inline]
+    pub fn calculate_checksum_ipv6(&self, src: Ipv6Addr, dst: Ipv6Addr) -> u16 {
+        ipv6_transport_checksum_zeroing(src, dst, 6, self.data.as_ref(), Self::FIELD_CHECKSUM)
+    }
+
+    /// Return whether the TCP checksum is valid for the given IPv6 endpoints.
+    ///
+    /// The viewer must contain the complete TCP segment, including payload
+    /// bytes, because the IPv6 pseudo-header checksum covers the whole segment.
+    #[inline]
+    pub fn validate_checksum_ipv6(&self, src: Ipv6Addr, dst: Ipv6Addr) -> bool {
+        self.checksum().get() == self.calculate_checksum_ipv6(src, dst)
     }
 
     /// Get the accessor of the source port.
@@ -530,5 +551,38 @@ mod tests {
 
         data[21] = b'o';
         assert!(!TcpViewer::new(&data).validate_checksum_ipv4(src, dst));
+    }
+
+    #[test]
+    fn tcp_checksum_helpers_ipv6() {
+        let src = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let dst = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+        let mut data = [
+            0x30, 0x39, // src_port
+            0x00, 0x50, // dst_port
+            0x00, 0x00, 0x00, 0x01, // seq_num
+            0x00, 0x00, 0x00, 0x00, // ack_num
+            0x50, // data_offset = 5
+            0x02, // flags = SYN
+            0x20, 0x00, // window_size
+            0x00, 0x00, // checksum
+            0x00, 0x00, // urgent_pointer
+            b'h', b'i',
+        ];
+
+        {
+            let mut tcp = TcpViewer::new(&mut data);
+            let checksum = tcp.calculate_checksum_ipv6(src, dst);
+            tcp.checksum_mut().set(checksum);
+        }
+
+        assert!(TcpViewer::new(&data).validate_checksum_ipv6(src, dst));
+        // The IPv4 pseudo header must not accept it.
+        assert!(
+            !TcpViewer::new(&data).validate_checksum_ipv4(Ipv4Addr::LOCALHOST, Ipv4Addr::LOCALHOST)
+        );
+
+        data[21] = b'o';
+        assert!(!TcpViewer::new(&data).validate_checksum_ipv6(src, dst));
     }
 }

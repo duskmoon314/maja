@@ -145,6 +145,7 @@ pub mod prelude {
                 ip::{
                     protocol::IpProtocol,
                     v4::{Ipv4, Ipv4Builder},
+                    v6::Ipv6,
                 },
                 raw::{Raw, RawBuilder},
                 tcp::{Tcp, TcpBuilder, TcpFlags},

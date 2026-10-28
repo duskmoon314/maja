@@ -87,7 +87,7 @@ impl ProtocolExt for Ntp {
     ) -> Result<(), crate::packet::error::ParseError> {
         ctx.require(&Ntp, offset, Ntp::MIN_LEN)?;
 
-        ctx.push_layer(&Ntp, offset, ctx.bytes.len() - offset);
+        ctx.push_layer(&Ntp, offset, ctx.rest(offset).len());
 
         Ok(())
     }

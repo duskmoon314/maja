@@ -5,7 +5,10 @@
 //! protocol viewer owns the protocol-specific rules for which bytes are
 //! covered and which checksum field must be zeroed before calculation.
 
-use std::{net::Ipv4Addr, ops::Range};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr},
+    ops::Range,
+};
 
 /// Calculate the Internet checksum over a byte slice.
 ///
@@ -112,9 +115,103 @@ pub fn ipv4_transport_checksum_zeroing(
     fold_checksum(sum)
 }
 
+/// Calculate a TCP, UDP or ICMPv6 checksum using an IPv6 pseudo header.
+///
+/// `segment` must contain the complete upper layer packet exactly as it appears
+/// after the IPv6 header and its extension headers, with its checksum field set
+/// to zero. Unlike IPv4 there is no length field to bound it, so the byte slice
+/// passed in defines the upper layer packet length of the pseudo header.
+pub fn ipv6_transport_checksum(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    next_header: u8,
+    segment: &[u8],
+) -> u16 {
+    let mut sum = 0u32;
+
+    add_words(&mut sum, &src.octets());
+    add_words(&mut sum, &dst.octets());
+    sum += segment.len() as u32;
+    sum += u32::from(next_header);
+    add_words(&mut sum, segment);
+
+    fold_checksum(sum)
+}
+
+/// Calculate an IPv6 transport checksum while treating a byte range as zero.
+///
+/// The `zeroed` range is relative to the start of `segment`.
+pub fn ipv6_transport_checksum_zeroing(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    next_header: u8,
+    segment: &[u8],
+    zeroed: Range<usize>,
+) -> u16 {
+    let mut sum = 0u32;
+
+    add_words(&mut sum, &src.octets());
+    add_words(&mut sum, &dst.octets());
+    sum += segment.len() as u32;
+    sum += u32::from(next_header);
+    add_words_zeroing(&mut sum, segment, zeroed);
+
+    fold_checksum(sum)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The IPv6 pseudo header spelled out byte by byte, so the helpers can be
+    /// checked against [`internet_checksum`] over the concatenation.
+    fn ipv6_pseudo_header(src: Ipv6Addr, dst: Ipv6Addr, next_header: u8, len: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&src.octets());
+        bytes.extend_from_slice(&dst.octets());
+        bytes.extend_from_slice(&len.to_be_bytes());
+        bytes.extend_from_slice(&[0, 0, 0, next_header]);
+        bytes
+    }
+
+    #[test]
+    fn ipv6_transport_checksum_matches_a_manual_pseudo_header() {
+        let src = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let dst = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+        // Odd length on purpose: the last byte must be zero padded.
+        let segment = [0x12, 0x34, 0x00, 0x00, b'h', b'i', 0x00];
+
+        let mut expected = ipv6_pseudo_header(src, dst, 17, segment.len() as u32);
+        expected.extend_from_slice(&segment);
+
+        assert_eq!(
+            ipv6_transport_checksum(src, dst, 17, &segment),
+            internet_checksum(&expected)
+        );
+
+        let mut expected_zeroed = ipv6_pseudo_header(src, dst, 17, segment.len() as u32);
+        expected_zeroed.extend_from_slice(&[0x12, 0x34, 0x00, 0x00, b'h', b'i', 0x00]);
+        assert_eq!(
+            ipv6_transport_checksum_zeroing(src, dst, 17, &segment, 2..4),
+            internet_checksum(&expected_zeroed)
+        );
+    }
+
+    #[test]
+    fn ipv6_transport_checksum_uses_a_32_bit_length() {
+        let src = Ipv6Addr::LOCALHOST;
+        let dst = Ipv6Addr::LOCALHOST;
+        // Longer than 65535 so that both halves of the length field matter.
+        let segment = vec![0x5a; 70_000];
+
+        let mut expected = ipv6_pseudo_header(src, dst, 6, segment.len() as u32);
+        expected.extend_from_slice(&segment);
+
+        assert_eq!(
+            ipv6_transport_checksum(src, dst, 6, &segment),
+            internet_checksum(&expected)
+        );
+    }
 
     #[test]
     fn internet_checksum_pads_odd_length_inputs() {

@@ -1,9 +1,10 @@
-//! Internet Protocol version 6 (IPv6) parsing.
+//! Internet Protocol version 6 (IPv6) parsing
+//! ([RFC 8200 section 3](https://www.rfc-editor.org/rfc/rfc8200.html#section-3)).
 //!
-//! IPv6 has a fixed 40-byte base header. Extension headers can appear between
-//! the base header and the transport header; this parser skips common extension
-//! headers and dispatches from the first transport header it recognizes. It does
-//! not currently create separate layers for extension headers.
+//! IPv6 has a fixed 40-byte base header. Extension headers between the base
+//! header and the transport header are handled by the [`ext`] module, which also
+//! owns the layers for them, and the options those headers carry are parsed by
+//! the [`option`](ext::option) module.
 //!
 //! ```text
 //!  0                   1                   2                   3
@@ -29,9 +30,19 @@ use crate::{
     field_spec, impl_target,
     packet::{
         ParseContext,
+        error::ParseError,
         layer::{Protocol, ProtocolExt, ip::protocol::IpProtocol},
         utils::field::{FieldMut, FieldRef},
     },
+};
+
+pub mod dispatch;
+pub mod ext;
+
+pub use ext::{
+    HipPacketType, Ipv6DestOpts, Ipv6ExtHeaderViewer, Ipv6Frag, Ipv6FragViewer, Ipv6Hip,
+    Ipv6Hopopt, Ipv6Mobility, Ipv6Option, Ipv6OptionKind, Ipv6Options, Ipv6Route, Ipv6RouteType,
+    Ipv6RouteViewer, Ipv6Shim6, MobilityType, Shim6MessageType, parse_ext_header,
 };
 
 impl_target!(frominto, core::net::Ipv6Addr, u128);
@@ -42,7 +53,7 @@ pub struct Ipv6;
 
 impl Ipv6 {
     /// IPv6 fixed header length.
-    const MIN_LEN: usize = 40;
+    pub const MIN_LEN: usize = 40;
 }
 
 impl Protocol for Ipv6 {
@@ -63,40 +74,35 @@ impl ProtocolExt for Ipv6 {
     type Viewer<'a> = Ipv6Viewer<&'a [u8]>;
     type ViewerMut<'a> = Ipv6Viewer<&'a mut [u8]>;
 
-    fn parse(
-        ctx: &mut ParseContext,
-        offset: usize,
-    ) -> Result<(), crate::packet::error::ParseError> {
+    fn parse(ctx: &mut ParseContext, offset: usize) -> Result<(), ParseError> {
         let header = ctx.require(&Ipv6, offset, Ipv6::MIN_LEN)?;
         let ipv6 = Ipv6Viewer::new(header);
         let next_header = ipv6.next_header().get();
 
         ctx.push_layer(&Ipv6, offset, Ipv6::MIN_LEN);
 
-        let (next_header, next_offset) = next_transport_header(ctx, offset, next_header)?;
-        let Some(next_header) = next_header else {
-            ctx.parse_raw(next_offset);
-            return Ok(());
+        let child_offset = offset + Ipv6::MIN_LEN;
+        // A zero `Payload Length` means a jumbogram or an offloaded packet: no
+        // header declares where the payload ends, so the capture is the bound.
+        let end = match usize::from(ipv6.payload_length().get()) {
+            0 => None,
+            len => Some(child_offset.saturating_add(len)),
         };
 
-        match next_header {
-            IpProtocol::Tcp => ctx.parse_child::<crate::packet::layer::tcp::Tcp>(next_offset)?,
-            IpProtocol::Udp => ctx.parse_child::<crate::packet::layer::udp::Udp>(next_offset)?,
-            IpProtocol::Gre => ctx.parse_child::<crate::packet::layer::gre::Gre>(next_offset)?,
-            IpProtocol::Sctp => ctx.parse_child::<crate::packet::layer::sctp::Sctp>(next_offset)?,
-            IpProtocol::Ipv6Icmp => {
-                ctx.parse_child::<crate::packet::layer::icmpv6::Icmpv6>(next_offset)?
-            }
-            protocol
-                if ctx
-                    .options
-                    .registry
-                    .contains_key(&(Ipv6.id(), protocol.into())) =>
-            {
-                let parse_fn = ctx.options.registry[&(Ipv6.id(), protocol.into())];
-                ctx.parse_child_with(parse_fn, next_offset)?;
-            }
-            _ => ctx.parse_raw(next_offset),
+        let outer_end = ctx.declared_end;
+        ctx.declared_end = match (outer_end, end) {
+            (Some(outer), Some(inner)) => Some(outer.min(inner)),
+            (outer, None) => outer,
+            (None, inner) => inner,
+        };
+        let result = dispatch::dispatch(ctx, child_offset, next_header);
+        ctx.declared_end = outer_end;
+        result?;
+
+        // Bytes past the declared payload are padding or a trailer, not payload:
+        // record them raw so the layer table still covers the frame.
+        if let Some(end) = end {
+            ctx.parse_raw(end);
         }
 
         Ok(())
@@ -108,45 +114,6 @@ impl ProtocolExt for Ipv6 {
 
     fn view_mut<'a>(bytes: &'a mut [u8]) -> Self::ViewerMut<'a> {
         Ipv6Viewer::new(bytes)
-    }
-}
-
-fn next_transport_header(
-    ctx: &ParseContext,
-    ipv6_offset: usize,
-    mut next_header: IpProtocol,
-) -> Result<(Option<IpProtocol>, usize), crate::packet::error::ParseError> {
-    let mut offset = ipv6_offset + Ipv6::MIN_LEN;
-
-    loop {
-        match next_header {
-            IpProtocol::Hopopt | IpProtocol::Ipv6Route | IpProtocol::Ipv6Opts => {
-                let ext = ctx.require(&Ipv6, offset, 2)?;
-                next_header = IpProtocol::from(ext[0]);
-                let ext_len = (ext[1] as usize + 1) * 8;
-                ctx.require(&Ipv6, offset, ext_len)?;
-                offset += ext_len;
-            }
-            IpProtocol::Ipv6Frag => {
-                let ext = ctx.require(&Ipv6, offset, 8)?;
-                next_header = IpProtocol::from(ext[0]);
-                let fragment = u16::from_be_bytes([ext[2], ext[3]]);
-                let fragment_offset = (fragment & 0xfff8) >> 3;
-                if fragment_offset != 0 {
-                    return Ok((None, offset));
-                }
-                offset += 8;
-            }
-            IpProtocol::Ah => {
-                let ext = ctx.require(&Ipv6, offset, 2)?;
-                next_header = IpProtocol::from(ext[0]);
-                let ext_len = (ext[1] as usize + 2) * 4;
-                ctx.require(&Ipv6, offset, ext_len)?;
-                offset += ext_len;
-            }
-            IpProtocol::Esp => return Ok((None, offset)),
-            _ => return Ok((Some(next_header), offset)),
-        }
     }
 }
 
@@ -326,8 +293,14 @@ where
 mod tests {
     use core::net::Ipv6Addr;
 
-    use crate::packet::{Packet, layer::eth::Eth};
+    use crate::packet::{
+        Packet, ParseOptions,
+        error::ParseError,
+        layer::{eth::Eth, icmpv6::Icmpv6, raw::Raw, udp::Udp},
+        utils::checksum::ipv6_transport_checksum_zeroing,
+    };
 
+    use super::ext::test_util::{eth_ipv6_frame_with_plen, layers, tcp_header, udp_header};
     use super::*;
 
     #[test]
@@ -383,5 +356,130 @@ mod tests {
             icmpv6.message_type(),
             crate::packet::layer::icmpv6::Icmpv6Type::EchoRequest
         );
+    }
+
+    /// The two addresses of every `eth_ipv6_frame` fixture.
+    fn endpoints() -> (Ipv6Addr, Ipv6Addr) {
+        (
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2),
+        )
+    }
+
+    #[test]
+    fn payload_length_bounds_the_child_region() {
+        // An eight-octet UDP header followed by two octets that the payload
+        // length does not cover.
+        let mut payload = udp_header();
+        payload.extend_from_slice(&[0xaa, 0xaa]);
+        let data = eth_ipv6_frame_with_plen(17, 8, &payload);
+
+        let mut packet = Packet::new(data.as_slice());
+        packet.parse::<Eth>(Default::default());
+
+        assert_eq!(layers(&packet), [&Eth as &dyn Protocol, &Ipv6, &Udp, &Raw]);
+        assert_eq!(packet.layer(Udp).unwrap().range(), 54..62);
+        // The bytes past the payload length stay visible as a raw trailer.
+        assert_eq!(packet.layer(Raw).unwrap().range(), 62..64);
+    }
+
+    #[test]
+    fn icmpv6_checksum_ignores_the_padding() {
+        let (src, dst) = endpoints();
+        let mut message = vec![
+            0x80, 0x00, 0x00, 0x00, // type, code, checksum
+            0x12, 0x34, 0x00, 0x01, // identifier, sequence
+            b'h', b'i', b'!', b'?',
+        ];
+        let checksum = ipv6_transport_checksum_zeroing(src, dst, 58, &message, 2..4);
+        message[2..4].copy_from_slice(&checksum.to_be_bytes());
+
+        let mut payload = message.clone();
+        payload.extend_from_slice(&[0xaa, 0xaa]);
+        let data = eth_ipv6_frame_with_plen(58, 12, &payload);
+
+        let mut packet = Packet::new(data.as_slice());
+        packet.parse::<Eth>(Default::default());
+
+        assert_eq!(packet.layer(Icmpv6).unwrap().range(), 54..66);
+        assert_eq!(packet.layer(Raw).unwrap().range(), 66..68);
+        assert!(
+            packet
+                .layer_viewer(Icmpv6)
+                .unwrap()
+                .validate_checksum_ipv6(src, dst)
+        );
+    }
+
+    #[test]
+    fn extension_header_longer_than_the_payload_is_clamped() {
+        // Hop-by-Hop that declares 24 octets while the payload length says 8.
+        let mut payload = vec![17, 2, 0, 0, 0, 0, 0, 0];
+        payload.extend_from_slice(&udp_header());
+        let data = eth_ipv6_frame_with_plen(0, 8, &payload);
+
+        let mut packet = Packet::new(data.as_slice());
+        packet.parse::<Eth>(Default::default());
+
+        assert_eq!(
+            layers(&packet),
+            [&Eth as &dyn Protocol, &Ipv6, &Ipv6Hopopt, &Raw]
+        );
+
+        let hopopt = packet.layer_viewer(Ipv6Hopopt).expect("hopopt layer");
+        assert_eq!(hopopt.header_len(), 24);
+        assert_eq!(hopopt.inner().len(), 8);
+
+        // Everything behind the declared payload is a raw trailer.
+        assert_eq!(packet.layer(Raw).unwrap().range(), 62..70);
+        assert!(packet.layer_viewer(Udp).is_none());
+    }
+
+    #[test]
+    fn extension_header_shorter_than_the_fixed_part_is_malformed() {
+        // HIP needs 40 octets, the header length field declares 8.
+        let payload = vec![17, 0, 0, 0, 0, 0, 0, 0];
+        let data = eth_ipv6_frame_with_plen(139, 8, &payload);
+
+        let mut packet = Packet::new(data.as_slice());
+        let err = packet
+            .try_parse::<Eth>(ParseOptions {
+                fallback_to_raw_on_child_error: false,
+                ..Default::default()
+            })
+            .expect_err("a short HIP header should be malformed");
+
+        assert!(matches!(
+            err,
+            ParseError::Malformed { protocol, .. } if protocol.id() == Ipv6Hip.id()
+        ));
+    }
+
+    #[test]
+    fn zero_payload_length_leaves_the_capture_as_the_bound() {
+        // A jumbogram or an offloaded packet: no declared end.
+        let mut payload = udp_header();
+        payload.extend_from_slice(&[0xaa, 0xaa]);
+        let data = eth_ipv6_frame_with_plen(17, 0, &payload);
+
+        let mut packet = Packet::new(data.as_slice());
+        packet.parse::<Eth>(Default::default());
+
+        assert_eq!(layers(&packet), [&Eth as &dyn Protocol, &Ipv6, &Udp, &Raw]);
+        assert_eq!(packet.layer(Raw).unwrap().range(), 62..64);
+    }
+
+    #[test]
+    fn payload_length_beyond_the_capture_is_truncated() {
+        // The payload length declares 40 octets, the capture stops after 8.
+        let mut payload = tcp_header();
+        payload.truncate(8);
+        let data = eth_ipv6_frame_with_plen(6, 40, &payload);
+
+        let mut packet = Packet::new(data.as_slice());
+        packet.parse::<Eth>(Default::default());
+
+        assert_eq!(layers(&packet), [&Eth as &dyn Protocol, &Ipv6, &Raw]);
+        assert_eq!(packet.layer(Raw).unwrap().range(), 54..62);
     }
 }

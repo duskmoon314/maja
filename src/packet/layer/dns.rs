@@ -73,7 +73,7 @@ impl ProtocolExt for Dns {
     ) -> Result<(), crate::packet::error::ParseError> {
         ctx.require(&Dns, offset, Dns::MIN_LEN)?;
 
-        ctx.push_layer(&Dns, offset, ctx.bytes.len() - offset);
+        ctx.push_layer(&Dns, offset, ctx.rest(offset).len());
 
         Ok(())
     }

@@ -88,7 +88,7 @@ impl ProtocolExt for Dhcp {
     ) -> Result<(), crate::packet::error::ParseError> {
         ctx.require(&Dhcp, offset, Dhcp::MIN_LEN)?;
 
-        ctx.push_layer(&Dhcp, offset, ctx.bytes.len() - offset);
+        ctx.push_layer(&Dhcp, offset, ctx.rest(offset).len());
 
         Ok(())
     }

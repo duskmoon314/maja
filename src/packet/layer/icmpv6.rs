@@ -18,11 +18,14 @@
 //! ~                              ...                              ~
 //! ```
 
+use std::net::Ipv6Addr;
+
 use crate::{
     field_spec,
     packet::{
         ParseContext,
         layer::{Protocol, ProtocolExt},
+        utils::checksum::ipv6_transport_checksum_zeroing,
         utils::field::{FieldMut, FieldRef},
     },
 };
@@ -72,7 +75,7 @@ impl ProtocolExt for Icmpv6 {
     ) -> Result<(), crate::packet::error::ParseError> {
         ctx.require(&Icmpv6, offset, Icmpv6::MIN_LEN)?;
 
-        let len = ctx.bytes.len() - offset;
+        let len = ctx.rest(offset).len();
         ctx.push_layer(&Icmpv6, offset, len);
 
         Ok(())
@@ -145,6 +148,23 @@ where
     #[inline]
     pub fn checksum(&self) -> FieldRef<'_, ChecksumSpec> {
         FieldRef::new(&self.data.as_ref()[Self::FIELD_CHECKSUM])
+    }
+
+    /// Calculate the ICMPv6 checksum using an IPv6 pseudo header.
+    ///
+    /// ICMPv6 always covers the pseudo header, so unlike ICMPv4 this needs both
+    /// endpoints. The checksum field is treated as zero during calculation and
+    /// the viewer must contain the complete ICMPv6 message, including any
+    /// quoted packet.
+    #[inline]
+    pub fn calculate_checksum_ipv6(&self, src: Ipv6Addr, dst: Ipv6Addr) -> u16 {
+        ipv6_transport_checksum_zeroing(src, dst, 58, self.data.as_ref(), Self::FIELD_CHECKSUM)
+    }
+
+    /// Return whether the ICMPv6 checksum is valid for the given endpoints.
+    #[inline]
+    pub fn validate_checksum_ipv6(&self, src: Ipv6Addr, dst: Ipv6Addr) -> bool {
+        self.checksum().get() == self.calculate_checksum_ipv6(src, dst)
     }
 
     /// Get the accessor of the 32-bit message-specific field.
@@ -447,5 +467,45 @@ mod tests {
         );
         assert_eq!(ns.options(), &[0x01, 0x01, 0xaa, 0xbb]);
         assert!(matches!(icmpv6.message(), Icmpv6MessageViewer::Ndp(_)));
+    }
+
+    /// Ground truth from `v6.pcap`: frame 3 is a Neighbor Solicitation, frame
+    /// 116 an Echo Request, and Wireshark marks both checksums as good.
+    #[test]
+    fn icmpv6_checksum_matches_captured_packets() {
+        const NEIGHBOR_SOLICITATION: &[u8] = &[
+            0x87, 0x00, 0x68, 0xbd, 0x00, 0x00, 0x00, 0x00, 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x02, 0x60, 0x97, 0xff, 0xfe, 0x07, 0x69, 0xea, 0x01, 0x01, 0x00, 0x00,
+            0x86, 0x05, 0x80, 0xda,
+        ];
+        const ECHO_REQUEST: &[u8] = &[
+            0x80, 0x00, 0xa5, 0x72, 0x76, 0x20, 0x00, 0x00, 0x01, 0xc9, 0xe7, 0x36, 0xd3, 0x39,
+            0x06, 0x00,
+        ];
+
+        let cases: &[(&[u8], &str, &str, u16)] = &[
+            (
+                NEIGHBOR_SOLICITATION,
+                "fe80::200:86ff:fe05:80da",
+                "fe80::260:97ff:fe07:69ea",
+                0x68bd,
+            ),
+            (
+                ECHO_REQUEST,
+                "3ffe:507:0:1:200:86ff:fe05:80da",
+                "3ffe:501:0:1001::2",
+                0xa572,
+            ),
+        ];
+
+        for (message, src, dst, expected) in cases {
+            let src: Ipv6Addr = src.parse().unwrap();
+            let dst: Ipv6Addr = dst.parse().unwrap();
+            let icmpv6 = Icmpv6Viewer::new(*message);
+
+            assert_eq!(icmpv6.checksum().get(), *expected);
+            assert_eq!(icmpv6.calculate_checksum_ipv6(src, dst), *expected);
+            assert!(icmpv6.validate_checksum_ipv6(src, dst));
+        }
     }
 }

@@ -114,6 +114,15 @@ pub trait Protocol: 'static + Debug {
     }
 }
 
+impl PartialEq for dyn Protocol {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.id() == other.id()
+    }
+}
+
+impl Eq for dyn Protocol {}
+
 /// Protocol parser and viewer contract.
 ///
 /// Implementors provide borrowed immutable and mutable viewers plus a parser
