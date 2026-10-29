@@ -228,7 +228,7 @@ mod tests {
             0x08, 0x00, // EtherType: IPv4
             0x46, // version + ihl
             0xc0, // dscp + ecn
-            0x00, 0x1c, // total length
+            0x00, 0x20, // total length: 24 byte header + 8 byte IGMP
             0x00, 0x00, // identification
             0x00, 0x00, // flags + fragment offset
             0x01, // ttl

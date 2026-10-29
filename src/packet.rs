@@ -409,8 +409,9 @@ pub struct ParseContext<'a> {
     /// enclosing header. `None` when no enclosing header states a length, so
     /// only the captured bytes bound the subtree.
     ///
-    /// A parser that bounds its children (IPv6 with its payload length) sets the
-    /// field before dispatching them and restores the previous value afterwards.
+    /// A parser that bounds its children (IPv4 by `total length`, IPv6 by
+    /// `payload length`) sets the field before dispatching them and restores the
+    /// previous value afterwards.
     pub declared_end: Option<usize>,
     /// Parse options selected by the caller.
     pub options: ParseOptions,

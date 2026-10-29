@@ -91,47 +91,77 @@ impl ProtocolExt for Ipv4 {
         ctx.push_layer(&Ipv4, offset, header_len);
 
         let ipv4 = Ipv4Viewer::new(header);
-        if ipv4.fragment_offset().get() != 0 {
-            ctx.parse_raw(offset + header_len);
-            return Ok(());
+        let child_offset = offset + header_len;
+
+        // `total length` covers the header and everything this packet carries, so
+        // the bytes behind it are a trailer, not payload. A zero value means
+        // segmentation offload (or a jumbogram), where no length is declared and
+        // the capture is the bound.
+        let total_length = usize::from(ipv4.total_length().get());
+        if total_length != 0 && total_length < header_len {
+            return Err(crate::packet::error::ParseError::Malformed {
+                protocol: &Ipv4,
+                field: "total length",
+                reason: "total length is smaller than the header length",
+            });
         }
+        let end = (total_length != 0).then(|| offset.saturating_add(total_length));
 
-        match ipv4.protocol().get() {
-            IpProtocol::Icmp => {
-                ctx.parse_child::<crate::packet::layer::icmp::Icmp>(offset + header_len)?;
+        let outer_end = ctx.declared_end;
+        ctx.declared_end = match (outer_end, end) {
+            (Some(outer), Some(inner)) => Some(outer.min(inner)),
+            (outer, None) => outer,
+            (None, inner) => inner,
+        };
+
+        // A fragment behind the first one carries no transport header, so its
+        // payload is raw bytes.
+        let result = if ipv4.fragment_offset().get() != 0 {
+            ctx.parse_raw(child_offset);
+            Ok(())
+        } else {
+            match ipv4.protocol().get() {
+                IpProtocol::Icmp => {
+                    ctx.parse_child::<crate::packet::layer::icmp::Icmp>(child_offset)
+                }
+
+                IpProtocol::Igmp => {
+                    ctx.parse_child::<crate::packet::layer::igmp::Igmp>(child_offset)
+                }
+
+                IpProtocol::Gre => ctx.parse_child::<crate::packet::layer::gre::Gre>(child_offset),
+
+                IpProtocol::Tcp => ctx.parse_child::<crate::packet::layer::tcp::Tcp>(child_offset),
+
+                IpProtocol::Udp => ctx.parse_child::<crate::packet::layer::udp::Udp>(child_offset),
+
+                IpProtocol::Sctp => {
+                    ctx.parse_child::<crate::packet::layer::sctp::Sctp>(child_offset)
+                }
+
+                protocol
+                    if ctx
+                        .options
+                        .registry
+                        .contains_key(&(Ipv4.id(), protocol.into())) =>
+                {
+                    let parse_fn = ctx.options.registry[&(Ipv4.id(), protocol.into())];
+                    ctx.parse_child_with(parse_fn, child_offset)
+                }
+
+                _ => {
+                    ctx.parse_raw(child_offset);
+                    Ok(())
+                }
             }
+        };
+        ctx.declared_end = outer_end;
+        result?;
 
-            IpProtocol::Igmp => {
-                ctx.parse_child::<crate::packet::layer::igmp::Igmp>(offset + header_len)?;
-            }
-
-            IpProtocol::Gre => {
-                ctx.parse_child::<crate::packet::layer::gre::Gre>(offset + header_len)?;
-            }
-
-            IpProtocol::Tcp => {
-                ctx.parse_child::<crate::packet::layer::tcp::Tcp>(offset + header_len)?;
-            }
-
-            IpProtocol::Udp => {
-                ctx.parse_child::<crate::packet::layer::udp::Udp>(offset + header_len)?;
-            }
-
-            IpProtocol::Sctp => {
-                ctx.parse_child::<crate::packet::layer::sctp::Sctp>(offset + header_len)?;
-            }
-
-            protocol
-                if ctx
-                    .options
-                    .registry
-                    .contains_key(&(Ipv4.id(), protocol.into())) =>
-            {
-                let parse_fn = ctx.options.registry[&(Ipv4.id(), protocol.into())];
-                ctx.parse_child_with(parse_fn, offset + header_len)?;
-            }
-
-            _ => ctx.parse_raw(offset + header_len),
+        // Padding or a trailer behind `total length` is not payload: record it raw
+        // so the layer table still covers the frame.
+        if let Some(end) = end {
+            ctx.parse_raw(end);
         }
 
         Ok(())
@@ -454,7 +484,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::packet::layer::eth::Eth;
+    use crate::packet::layer::{eth::Eth, icmp::Icmp};
+    use crate::packet::{Packet, ParseOptions, error::ParseError};
 
     use super::*;
 
@@ -633,5 +664,156 @@ mod tests {
         assert_eq!(ipv4.checksum(), 0);
         assert_eq!(ipv4.src(), core::net::Ipv4Addr::new(127, 0, 0, 1));
         assert_eq!(ipv4.dst(), core::net::Ipv4Addr::new(127, 0, 0, 2));
+    }
+
+    /// Decode a hex string into bytes.
+    fn bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Ethernet + IPv4 (`ihl` 5) + `payload` + `trailer`.
+    ///
+    /// `total_length` is written as given, so a caller can declare a length that
+    /// does not cover the captured bytes.
+    fn eth_ipv4_frame(total_length: u16, protocol: u8, payload: &[u8], trailer: &[u8]) -> Vec<u8> {
+        let mut data = vec![
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, // destination MAC
+            0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, // source MAC
+            0x08, 0x00, // EtherType: IPv4
+            0x45, // version 4, ihl 5
+            0x00, // dscp 0, ecn 0
+        ];
+        data.extend_from_slice(&total_length.to_be_bytes());
+        data.extend_from_slice(&[
+            0x00, 0x01, // identification
+            0x40, 0x00, // flags 0, fragment offset 0
+            0x40, // ttl 64
+            protocol, 0x00, 0x00, // checksum
+            10, 0, 0, 1, // src ip
+            10, 0, 0, 2, // dst ip
+        ]);
+        data.extend_from_slice(payload);
+        data.extend_from_slice(trailer);
+
+        data
+    }
+
+    fn layer_spans<T: AsRef<[u8]>>(packet: &Packet<T>) -> Vec<core::ops::Range<usize>> {
+        packet.layers().iter().map(|layer| layer.range()).collect()
+    }
+
+    #[test]
+    fn total_length_bounds_the_child_region() {
+        // The ICMP echo of 28 octets `total_length` declares, captured with 18
+        // octets of padding behind it as an Ethernet frame padded to its minimum
+        // size needs.
+        let mut data = bytes(
+            "00112233445566778899aabb08004500001c00014000400126de0a0000010a0000020800e5ca12340001",
+        );
+        data.extend(std::iter::repeat_n(0xab, 18));
+
+        let mut packet = Packet::new(data.as_slice());
+        packet.parse::<Eth>(Default::default());
+
+        assert_eq!(
+            layer_spans(&packet),
+            [0..14, 14..34, 34..42, 42..60],
+            "the padding is a trailer, not part of the ICMP message"
+        );
+    }
+
+    #[test]
+    fn padded_frame_keeps_the_icmp_checksum_valid() {
+        // Same frame as above: the checksum covers the eight octets of the ICMP
+        // message only, so a padded frame must still validate.
+        let mut data = bytes(
+            "00112233445566778899aabb08004500001c00014000400126de0a0000010a0000020800e5ca12340001",
+        );
+
+        let unpadded = {
+            let mut packet = Packet::new(data.as_slice());
+            packet.parse::<Eth>(Default::default());
+            packet
+                .layer_viewer(Icmp)
+                .expect("icmp layer")
+                .validate_checksum()
+        };
+        data.extend(std::iter::repeat_n(0xab, 18));
+
+        let padded = {
+            let mut packet = Packet::new(data.as_slice());
+            packet.parse::<Eth>(Default::default());
+            packet
+                .layer_viewer(Icmp)
+                .expect("icmp layer")
+                .validate_checksum()
+        };
+
+        assert!(unpadded);
+        assert!(padded, "padding must not be checksummed");
+    }
+
+    #[test]
+    fn a_later_fragment_keeps_its_payload_and_its_trailer_apart() {
+        // A fragment behind the first one has no transport header, so the bytes
+        // `total_length` declares are raw and the rest is a separate trailer.
+        let mut payload = vec![0xaa; 16];
+        payload.extend(std::iter::repeat_n(0xbb, 4));
+
+        let mut data = eth_ipv4_frame(36, 6, &payload, &[]);
+        // flags 0, fragment offset 2 (16 octets), identification 1
+        data[20..22].copy_from_slice(&[0x00, 0x02]);
+
+        let mut packet = Packet::new(data.as_slice());
+        packet.parse::<Eth>(Default::default());
+
+        assert_eq!(layer_spans(&packet), [0..14, 14..34, 34..50, 50..54]);
+    }
+
+    #[test]
+    fn total_length_beyond_the_capture_is_clamped() {
+        // A lying `total_length` must not widen the region past the capture.
+        let payload = [8u8, 0, 0, 0, 0x12, 0x34, 0, 1];
+        let data = eth_ipv4_frame(2000, 1, &payload, &[]);
+
+        let mut packet = Packet::new(data.as_slice());
+        packet.parse::<Eth>(Default::default());
+
+        assert_eq!(layer_spans(&packet), [0..14, 14..34, 34..42]);
+    }
+
+    #[test]
+    fn total_length_smaller_than_the_header_is_malformed() {
+        let payload = [0u8; 8];
+        let data = eth_ipv4_frame(10, 17, &payload, &[]);
+
+        let mut packet = Packet::new(data.as_slice());
+        let err = packet
+            .try_parse::<Eth>(ParseOptions {
+                fallback_to_raw_on_child_error: false,
+                ..Default::default()
+            })
+            .expect_err("a total length below the header length is malformed");
+
+        assert!(matches!(
+            err,
+            ParseError::Malformed { protocol, .. } if protocol.id() == Ipv4.id()
+        ));
+    }
+
+    #[test]
+    fn zero_total_length_leaves_the_capture_as_the_bound() {
+        // Offload or a jumbogram: no length is declared, so the capture bounds the
+        // payload and nothing is recorded as a trailer.
+        let payload = [8u8, 0, 0, 0, 0x12, 0x34, 0, 1];
+        let data = eth_ipv4_frame(0, 1, &payload, &[0xaa, 0xbb]);
+
+        let mut packet = Packet::new(data.as_slice());
+        packet.parse::<Eth>(Default::default());
+
+        assert_eq!(layer_spans(&packet), [0..14, 14..34, 34..44]);
     }
 }
