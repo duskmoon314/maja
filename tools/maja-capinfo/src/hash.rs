@@ -2,6 +2,11 @@ use std::{
     cell::RefCell,
     io::{self, Read},
     rc::Rc,
+    sync::{
+        Arc,
+        mpsc::{Receiver, SyncSender, sync_channel},
+    },
+    thread::{self, JoinHandle},
 };
 
 use base16ct::lower::encode_string as to_hex;
@@ -16,40 +21,47 @@ pub struct FileHashes {
     pub sha256: String,
 }
 
-/// Hashers driven in lockstep, shared between [`HashingReader`] and [`HashHandle`].
-#[derive(Debug, Default)]
-struct MultiHasher {
-    md5: md5::Md5,
-    sha1: sha1::Sha1,
-    sha256: sha2::Sha256,
+/// One chunk of the capture, shared by the reader and every hasher.
+type Chunk = Arc<[u8]>;
+
+/// How many chunks a hasher may fall behind before the reader blocks.
+///
+/// A chunk is coalesced up to [`CHUNK_SIZE`], so 4 chunks cap the backlog at
+/// 1 MiB per hasher.
+const CHANNEL_DEPTH: usize = 4;
+
+/// Bytes the reader gathers before handing a chunk to the hashers.
+const CHUNK_SIZE: usize = 256 * 1024;
+
+/// Hash `rx` with `D` on a thread of its own, returning the digest.
+fn spawn<D>(name: &str, rx: Receiver<Chunk>) -> JoinHandle<Vec<u8>>
+where
+    D: Digest + Default,
+{
+    thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let mut hasher = D::default();
+            for chunk in rx {
+                hasher.update(&chunk);
+            }
+            hasher.finalize().to_vec()
+        })
+        .expect("spawn hash worker")
 }
 
-impl MultiHasher {
-    fn update(&mut self, data: &[u8]) {
-        self.md5.update(data);
-        self.sha1.update(data);
-        self.sha256.update(data);
-    }
-
-    fn finalize(self) -> FileHashes {
-        FileHashes {
-            md5: to_hex(&self.md5.finalize()),
-            sha1: to_hex(&self.sha1.finalize()),
-            sha256: to_hex(&self.sha256.finalize()),
-        }
-    }
-}
-
-/// A reader that feeds every byte it yields into the shared [`MultiHasher`].
+/// A reader that feeds every chunk it yields to one hasher thread per algorithm.
 #[derive(Debug)]
 pub struct HashingReader<R> {
     inner: R,
-    shared: Rc<RefCell<MultiHasher>>,
+    senders: Rc<RefCell<Vec<SyncSender<Chunk>>>>,
+    staged: Vec<u8>,
 }
 
 /// Handle used to retrieve the digests once the capture has been fully read.
 pub struct HashHandle {
-    shared: Rc<RefCell<MultiHasher>>,
+    senders: Rc<RefCell<Vec<SyncSender<Chunk>>>>,
+    workers: Vec<JoinHandle<Vec<u8>>>,
 }
 
 impl<R: Read> HashingReader<R> {
@@ -57,13 +69,27 @@ impl<R: Read> HashingReader<R> {
     ///
     /// Returns the reader together with the [`HashHandle`] used to retrieve the digests.
     pub fn new(inner: R) -> (Self, HashHandle) {
-        let shared = Rc::new(RefCell::new(MultiHasher::default()));
+        let mut senders = Vec::with_capacity(3);
+        let mut workers = Vec::with_capacity(3);
+
+        for name in ["hash-md5", "hash-sha1", "hash-sha256"] {
+            let (tx, rx) = sync_channel(CHANNEL_DEPTH);
+            senders.push(tx);
+            workers.push(match name {
+                "hash-md5" => spawn::<md5::Md5>(name, rx),
+                "hash-sha1" => spawn::<sha1::Sha1>(name, rx),
+                _ => spawn::<sha2::Sha256>(name, rx),
+            });
+        }
+
+        let senders = Rc::new(RefCell::new(senders));
         (
             Self {
                 inner,
-                shared: Rc::clone(&shared),
+                senders: Rc::clone(&senders),
+                staged: Vec::with_capacity(CHUNK_SIZE),
             },
-            HashHandle { shared },
+            HashHandle { senders, workers },
         )
     }
 }
@@ -71,15 +97,52 @@ impl<R: Read> HashingReader<R> {
 impl<R: Read> Read for HashingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let read = self.inner.read(buf)?;
-        self.shared.borrow_mut().update(&buf[..read]);
+        if read == 0 {
+            self.flush()?;
+            return Ok(0);
+        }
+
+        self.staged.extend_from_slice(&buf[..read]);
+        if self.staged.len() >= CHUNK_SIZE {
+            self.flush()?;
+        }
         Ok(read)
+    }
+}
+
+impl<R> HashingReader<R> {
+    /// Hand the staged bytes to the hashers.
+    fn flush(&mut self) -> io::Result<()> {
+        if self.staged.is_empty() {
+            return Ok(());
+        }
+
+        let staged = std::mem::replace(&mut self.staged, Vec::with_capacity(CHUNK_SIZE));
+        let chunk: Chunk = Arc::from(staged);
+        for sender in self.senders.borrow().iter() {
+            sender
+                .send(Arc::clone(&chunk))
+                .map_err(|_| io::Error::other("a hash worker stopped"))?;
+        }
+        Ok(())
     }
 }
 
 impl HashHandle {
     /// Finalize the hashers and return the hex-encoded digests.
     pub fn finish(self) -> FileHashes {
-        self.shared.replace(MultiHasher::default()).finalize()
+        // Closing the channels is what ends the hasher loops.
+        self.senders.borrow_mut().clear();
+
+        let mut digests = self
+            .workers
+            .into_iter()
+            .map(|worker| worker.join().expect("hash worker panicked"));
+        FileHashes {
+            md5: to_hex(&digests.next().expect("md5 worker")),
+            sha1: to_hex(&digests.next().expect("sha1 worker")),
+            sha256: to_hex(&digests.next().expect("sha256 worker")),
+        }
     }
 }
 

@@ -1564,12 +1564,13 @@ dependencies = [
 
 [[package]]
 name = "maja-capinfo"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "base16ct",
  "clap",
  "env_logger",
+ "foldhash 0.2.0",
  "human_format",
  "indicatif",
  "indicatif-log-bridge",

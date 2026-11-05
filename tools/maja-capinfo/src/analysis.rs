@@ -1,7 +1,6 @@
-use std::{
-    collections::{HashMap, HashSet},
-    net::IpAddr,
-};
+use std::net::IpAddr;
+
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 
 use itertools::Itertools;
 use maja::packet::{flow::FlowIdSymmetric, layer::ip::protocol::IpProtocol};
@@ -378,36 +377,10 @@ mod tests {
 
     #[test]
     fn top_items_have_deterministic_ties() {
-        let counts = HashMap::from([
-            (
-                3_u16,
-                RunningTrafficStats {
-                    count: 2,
-                    bytes: 20,
-                },
-            ),
-            (
-                1_u16,
-                RunningTrafficStats {
-                    count: 2,
-                    bytes: 30,
-                },
-            ),
-            (
-                2_u16,
-                RunningTrafficStats {
-                    count: 3,
-                    bytes: 10,
-                },
-            ),
-            (
-                4_u16,
-                RunningTrafficStats {
-                    count: 2,
-                    bytes: 30,
-                },
-            ),
-        ]);
+        let mut counts = HashMap::default();
+        for (key, count, bytes) in [(3_u16, 2, 20), (1, 2, 30), (2, 3, 10), (4, 2, 30)] {
+            counts.insert(key, RunningTrafficStats { count, bytes });
+        }
 
         assert_eq!(
             top_items(&counts, 2),
