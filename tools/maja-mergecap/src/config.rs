@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use clap::{ArgAction, Args, Parser};
+use clap::{Args, Parser};
 use glob::glob;
 use log::{error, warn};
 use serde::Deserialize;
@@ -798,7 +798,14 @@ fn check_flow_map(flow: &FlowMap, path: &str) -> anyhow::Result<()> {
 #[derive(Debug, Clone, Default, Args, Deserialize)]
 pub struct MergeArgs {
     /// Whether to erase the timestamps of the packets in the output file
-    #[arg(short, long, action = ArgAction::SetTrue)]
+    #[arg(
+        short,
+        long,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        hide_possible_values = true
+    )]
     pub erase_timestamp: Option<bool>,
 
     /// The snap len of the output file
@@ -806,7 +813,13 @@ pub struct MergeArgs {
     pub snap_len: Option<u32>,
 
     /// The precision of the timestamp
-    #[arg(long, action = ArgAction::SetTrue)]
+    #[arg(
+        long,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        hide_possible_values = true
+    )]
     pub nanosecond: Option<bool>,
 
     /// Whether to keep sub-second precision when erasing timestamps
@@ -819,7 +832,13 @@ pub struct MergeArgs {
     /// timestamps will be set to start_time.
     ///
     /// If erase_timestamp is false, this option has no effect.
-    #[arg(long, action = ArgAction::SetTrue)]
+    #[arg(
+        long,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        hide_possible_values = true
+    )]
     pub keep_subsecond: Option<bool>,
 
     /// The number of input files to merge in a single pass.
@@ -837,7 +856,13 @@ pub struct MergeArgs {
 
     /// Do not recompute the IPv4 header and TCP/UDP checksums after rewriting
     /// addresses.
-    #[arg(long = "no-fix-checksum", action = ArgAction::SetFalse)]
+    #[arg(
+        long = "no-fix-checksum",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "false",
+        hide_possible_values = true
+    )]
     pub fix_checksum: Option<bool>,
 }
 
@@ -965,6 +990,21 @@ mod tests {
             flow_map: flow,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn absent_flags_leave_the_config_file_in_charge() {
+        let cli = Cli::try_parse_from(["maja-mergecap", "-c", "a.json", "a.pcap"]).unwrap();
+        let args = &cli.config.merge_args;
+        assert_eq!(args.erase_timestamp, None);
+        assert_eq!(args.nanosecond, None);
+        assert_eq!(args.keep_subsecond, None);
+        assert_eq!(args.fix_checksum, None);
+
+        let cli = Cli::try_parse_from(["maja-mergecap", "--erase-timestamp", "--no-fix-checksum"])
+            .unwrap();
+        assert_eq!(cli.config.merge_args.erase_timestamp, Some(true));
+        assert_eq!(cli.config.merge_args.fix_checksum, Some(false));
     }
 
     #[test]

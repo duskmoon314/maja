@@ -14,17 +14,28 @@ Arguments:
   [INPUT_FILES]...  The input files to merge
 
 Options:
-  -c, --config-file <FILE>         The config file to use
-  -o, --output-file <OUTPUT_FILE>  The output file to write the merged packets to
-  -e, --erase-timestamp            Whether to erase the timestamps of the packets in the output file
-      --snap-len <SNAP_LEN>        The snap len of the output file
-      --nanosecond                 The precision of the timestamp
-      --keep-subsecond             Whether to keep sub-second precision when erasing timestamps
-      --batch-size <BATCH_SIZE>    The number of input files to merge in a single pass
-      --seed <SEED>                Seed for the random address mapping
-      --no-fix-checksum            Do not recompute the IPv4 header and TCP/UDP checksums
-  -h, --help                       Print help (see more with '--help')
-  -V, --version                    Print version
+  -c, --config-file <FILE>
+          The config file to use
+  -o, --output-file <OUTPUT_FILE>
+          The output file to write the merged packets to
+  -e, --erase-timestamp[=<ERASE_TIMESTAMP>]
+          Whether to erase the timestamps of the packets in the output file
+      --snap-len <SNAP_LEN>
+          The snap len of the output file
+      --nanosecond[=<NANOSECOND>]
+          The precision of the timestamp
+      --keep-subsecond[=<KEEP_SUBSECOND>]
+          Whether to keep sub-second precision when erasing timestamps
+      --batch-size <BATCH_SIZE>
+          The number of input files to merge in a single pass
+      --seed <SEED>
+          Seed for the random address mapping
+      --no-fix-checksum[=<FIX_CHECKSUM>]
+          Do not recompute the IPv4 header and TCP/UDP checksums after rewriting addresses
+  -h, --help
+          Print help (see more with '--help')
+  -V, --version
+          Print version
 ```
 
 The input files can be appended with configuration:
